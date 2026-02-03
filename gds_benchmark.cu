@@ -383,7 +383,116 @@ BenchmarkStats benchmarkTraditional(const BenchmarkConfig& config) {
 }
 #endif
 
+// Print help message
+void printHelp(const char* programName) {
+    printf("GPU Direct Storage Latency & Throughput Benchmark\n");
+    printf("==================================================\n\n");
+    printf("Usage: %s [OPTIONS]\n\n", programName);
+    printf("Options:\n");
+    printf("  -h, --help              Show this help message\n");
+    printf("  -s, --size SIZE         File size in GB (default: 4)\n");
+    printf("  -f, --file PATH         Test file path (default: /mnt/tmp/gds_benchmark.dat)\n");
+    printf("  -b, --block SIZE        Block size in KB (default: test all sizes)\n");
+    printf("                          Examples: 4, 64, 1024, 4096\n");
+    printf("  -q, --queue DEPTH       Queue depth (default: 1)\n");
+    printf("                          Note: Currently single-threaded, QD>1 for future use\n");
+    printf("  -i, --iterations NUM    Number of iterations per test (default: auto)\n");
+    printf("\n");
+    printf("Block Size Presets:\n");
+    printf("  If -b is not specified, tests all sizes: 4KB, 16KB, 64KB, 256KB,\n");
+    printf("  1MB, 4MB, 16MB, 64MB, 128MB\n");
+    printf("\n");
+    printf("Examples:\n");
+    printf("  %s                           # Run with defaults\n", programName);
+    printf("  %s -s 8                      # 8GB test file\n", programName);
+    printf("  %s -s 4 -f /nvme/test.dat    # Custom file path\n", programName);
+    printf("  %s -b 4096                   # Test only 4MB block size\n", programName);
+    printf("  %s -b 64 -i 10000            # 64KB blocks, 10000 iterations\n", programName);
+    printf("  %s -s 8 -b 1024 -q 4         # 8GB file, 1MB blocks, QD=4\n", programName);
+    printf("\n");
+    printf("Output:\n");
+    printf("  - Console: Detailed statistics for each test\n");
+    printf("  - CSV: gds_benchmark_results.csv (all metrics for analysis)\n");
+    printf("\n");
+}
+
+// Parse size with unit support (e.g., "4096" or "4M" or "1G")
+size_t parseSize(const char* str) {
+    char* endptr;
+    long long value = strtoll(str, &endptr, 10);
+
+    if (endptr == str) {
+        fprintf(stderr, "Invalid size: %s\n", str);
+        exit(1);
+    }
+
+    // Check for unit suffix (K, M, G)
+    if (*endptr == 'K' || *endptr == 'k') {
+        value *= 1024;
+    } else if (*endptr == 'M' || *endptr == 'm') {
+        value *= 1024 * 1024;
+    } else if (*endptr == 'G' || *endptr == 'g') {
+        value *= 1024 * 1024 * 1024;
+    }
+
+    return (size_t)value;
+}
+
 int main(int argc, char** argv) {
+    // Default parameters
+    size_t fileSize = 4ULL * 1024 * 1024 * 1024;  // 4GB
+    const char* filename = "/mnt/tmp/gds_benchmark.dat";
+    int customBlockSize = -1;  // -1 means test all sizes
+    int queueDepth = 1;
+    int customIterations = -1;  // -1 means auto-calculate
+
+    // Parse command-line arguments
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            printHelp(argv[0]);
+            return 0;
+        } else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--size") == 0) {
+            if (i + 1 < argc) {
+                fileSize = atoll(argv[++i]) * 1024ULL * 1024 * 1024;
+            } else {
+                fprintf(stderr, "Error: -s/--size requires an argument\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) {
+            if (i + 1 < argc) {
+                filename = argv[++i];
+            } else {
+                fprintf(stderr, "Error: -f/--file requires an argument\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--block") == 0) {
+            if (i + 1 < argc) {
+                customBlockSize = atoi(argv[++i]);
+            } else {
+                fprintf(stderr, "Error: -b/--block requires an argument\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--queue") == 0) {
+            if (i + 1 < argc) {
+                queueDepth = atoi(argv[++i]);
+            } else {
+                fprintf(stderr, "Error: -q/--queue requires an argument\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--iterations") == 0) {
+            if (i + 1 < argc) {
+                customIterations = atoi(argv[++i]);
+            } else {
+                fprintf(stderr, "Error: -i/--iterations requires an argument\n");
+                return 1;
+            }
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            fprintf(stderr, "Use -h or --help for usage information\n");
+            return 1;
+        }
+    }
+
     printf("GPU Direct Storage Latency & Throughput Benchmark\n");
     printf("==================================================\n\n");
 
@@ -401,38 +510,45 @@ int main(int argc, char** argv) {
     printf("Estimated PCIe Bandwidth: %.1f GB/s\n\n", pcieBandwidth);
 
 #ifdef USE_CUFILE
-    // Test configuration
-    const char* filename = "/mnt/tmp/gds_benchmark.dat";
-    size_t fileSize = 4ULL * 1024 * 1024 * 1024;  // 4GB
-
-    if (argc > 1) {
-        fileSize = atoll(argv[1]) * 1024ULL * 1024 * 1024;  // GB
+    // Print configuration
+    printf("Configuration:\n");
+    printf("  Test File: %s\n", filename);
+    printf("  File Size: %.2f GB\n", fileSize / (1024.0*1024.0*1024.0));
+    if (customBlockSize > 0) {
+        printf("  Block Size: %d KB\n", customBlockSize);
+    } else {
+        printf("  Block Sizes: 4KB to 128MB (9 sizes)\n");
     }
-    if (argc > 2) {
-        filename = argv[2];
+    printf("  Queue Depth: %d\n", queueDepth);
+    if (customIterations > 0) {
+        printf("  Iterations: %d\n", customIterations);
+    } else {
+        printf("  Iterations: Auto (min 100, max 10000)\n");
     }
-
-    printf("Test File: %s\n", filename);
-    printf("File Size: %.2f GB\n\n", fileSize / (1024.0*1024.0*1024.0));
+    printf("\n");
 
     // Create test file
     createTestFile(filename, fileSize);
 
-    // Block sizes to test (4KB to 128MB)
-    std::vector<size_t> blockSizes = {
-        4 * 1024,           // 4KB
-        16 * 1024,          // 16KB
-        64 * 1024,          // 64KB
-        256 * 1024,         // 256KB
-        1 * 1024 * 1024,    // 1MB
-        4 * 1024 * 1024,    // 4MB
-        16 * 1024 * 1024,   // 16MB
-        64 * 1024 * 1024,   // 64MB
-        128 * 1024 * 1024   // 128MB
-    };
-
-    // Queue depths to test
-    std::vector<int> queueDepths = {1};  // Start with QD=1 for latency
+    // Block sizes to test
+    std::vector<size_t> blockSizes;
+    if (customBlockSize > 0) {
+        // User specified a single block size (in KB)
+        blockSizes.push_back(customBlockSize * 1024ULL);
+    } else {
+        // Test all default sizes (4KB to 128MB)
+        blockSizes = {
+            4 * 1024,           // 4KB
+            16 * 1024,          // 16KB
+            64 * 1024,          // 64KB
+            256 * 1024,         // 256KB
+            1 * 1024 * 1024,    // 1MB
+            4 * 1024 * 1024,    // 4MB
+            16 * 1024 * 1024,   // 16MB
+            64 * 1024 * 1024,   // 64MB
+            128 * 1024 * 1024   // 128MB
+        };
+    }
 
     // CSV output file
     FILE* csvFile = fopen("gds_benchmark_results.csv", "w");
@@ -445,8 +561,13 @@ int main(int argc, char** argv) {
     // Run benchmarks for different block sizes
     for (size_t blockSize : blockSizes) {
         // Calculate iterations to read at least 1GB of data
-        int iterations = std::max(100, (int)(1024*1024*1024 / blockSize));
-        iterations = std::min(iterations, 10000);  // Cap at 10000
+        int iterations;
+        if (customIterations > 0) {
+            iterations = customIterations;
+        } else {
+            iterations = std::max(100, (int)(1024*1024*1024 / blockSize));
+            iterations = std::min(iterations, 10000);  // Cap at 10000
+        }
 
         printf("\n" "========================================\n");
         printf("Block Size: %zu KB\n", blockSize / 1024);
@@ -455,15 +576,15 @@ int main(int argc, char** argv) {
         // Test 1: GDS Random Read
         {
             BenchmarkConfig config = {
-                fileSize, blockSize, 1, iterations, filename, false, true
+                fileSize, blockSize, queueDepth, iterations, filename, false, true
             };
             BenchmarkStats stats = benchmarkGDS(config);
             calculateStats(stats, config, pcieBandwidth);
             printStats(stats, config, "GDS Random Read");
 
             if (csvFile) {
-                fprintf(csvFile, "GDS,Read,Random,%zu,1,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
-                        blockSize/1024, iterations, stats.minLatency, stats.avgLatency,
+                fprintf(csvFile, "GDS,Read,Random,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
+                        blockSize/1024, queueDepth, iterations, stats.minLatency, stats.avgLatency,
                         stats.p50Latency, stats.p95Latency, stats.p99Latency, stats.p999Latency,
                         stats.maxLatency, stats.throughput, stats.iops, stats.bandwidthUtil, stats.totalTime);
             }
@@ -472,15 +593,15 @@ int main(int argc, char** argv) {
         // Test 2: Traditional Random Read
         {
             BenchmarkConfig config = {
-                fileSize, blockSize, 1, iterations, filename, false, true
+                fileSize, blockSize, queueDepth, iterations, filename, false, true
             };
             BenchmarkStats stats = benchmarkTraditional(config);
             calculateStats(stats, config, pcieBandwidth);
             printStats(stats, config, "Traditional Random Read");
 
             if (csvFile) {
-                fprintf(csvFile, "Traditional,Read,Random,%zu,1,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
-                        blockSize/1024, iterations, stats.minLatency, stats.avgLatency,
+                fprintf(csvFile, "Traditional,Read,Random,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
+                        blockSize/1024, queueDepth, iterations, stats.minLatency, stats.avgLatency,
                         stats.p50Latency, stats.p95Latency, stats.p99Latency, stats.p999Latency,
                         stats.maxLatency, stats.throughput, stats.iops, stats.bandwidthUtil, stats.totalTime);
             }
@@ -492,15 +613,15 @@ int main(int argc, char** argv) {
             createTestFile(writeFile, fileSize);
 
             BenchmarkConfig config = {
-                fileSize, blockSize, 1, iterations, writeFile, true, true
+                fileSize, blockSize, queueDepth, iterations, writeFile, true, true
             };
             BenchmarkStats stats = benchmarkGDS(config);
             calculateStats(stats, config, pcieBandwidth);
             printStats(stats, config, "GDS Random Write");
 
             if (csvFile) {
-                fprintf(csvFile, "GDS,Write,Random,%zu,1,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
-                        blockSize/1024, iterations, stats.minLatency, stats.avgLatency,
+                fprintf(csvFile, "GDS,Write,Random,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
+                        blockSize/1024, queueDepth, iterations, stats.minLatency, stats.avgLatency,
                         stats.p50Latency, stats.p95Latency, stats.p99Latency, stats.p999Latency,
                         stats.maxLatency, stats.throughput, stats.iops, stats.bandwidthUtil, stats.totalTime);
             }
@@ -514,15 +635,15 @@ int main(int argc, char** argv) {
             createTestFile(writeFile, fileSize);
 
             BenchmarkConfig config = {
-                fileSize, blockSize, 1, iterations, writeFile, true, true
+                fileSize, blockSize, queueDepth, iterations, writeFile, true, true
             };
             BenchmarkStats stats = benchmarkTraditional(config);
             calculateStats(stats, config, pcieBandwidth);
             printStats(stats, config, "Traditional Random Write");
 
             if (csvFile) {
-                fprintf(csvFile, "Traditional,Write,Random,%zu,1,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
-                        blockSize/1024, iterations, stats.minLatency, stats.avgLatency,
+                fprintf(csvFile, "Traditional,Write,Random,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
+                        blockSize/1024, queueDepth, iterations, stats.minLatency, stats.avgLatency,
                         stats.p50Latency, stats.p95Latency, stats.p99Latency, stats.p999Latency,
                         stats.maxLatency, stats.throughput, stats.iops, stats.bandwidthUtil, stats.totalTime);
             }

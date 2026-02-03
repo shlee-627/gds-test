@@ -88,26 +88,54 @@ make help       # Show help
 
 ## Usage
 
-### Basic Usage
+### Command-Line Options
 ```bash
-./gds_benchmark [file_size_GB] [file_path]
+./gds_benchmark [OPTIONS]
+
+Options:
+  -h, --help              Show help message
+  -s, --size SIZE         File size in GB (default: 4)
+  -f, --file PATH         Test file path (default: /mnt/tmp/gds_benchmark.dat)
+  -b, --block SIZE        Block size in KB (default: test all sizes)
+  -q, --queue DEPTH       Queue depth (default: 1)
+  -i, --iterations NUM    Number of iterations per test (default: auto)
 ```
 
 ### Examples
 
-**Default (4GB file in /mnt/tmp)**:
+**Show help**:
+```bash
+./gds_benchmark --help
+```
+
+**Default (4GB file, all block sizes)**:
 ```bash
 ./gds_benchmark
 ```
 
 **Custom file size (8GB)**:
 ```bash
-./gds_benchmark 8
+./gds_benchmark -s 8
 ```
 
 **Custom file size and path**:
 ```bash
-./gds_benchmark 8 /mnt/nvme0/benchmark.dat
+./gds_benchmark -s 8 -f /mnt/nvme0/benchmark.dat
+```
+
+**Test specific block size (4MB only)**:
+```bash
+./gds_benchmark -b 4096
+```
+
+**Test 64KB blocks with 10000 iterations**:
+```bash
+./gds_benchmark -b 64 -i 10000
+```
+
+**Full custom configuration**:
+```bash
+./gds_benchmark -s 8 -f /nvme/test.dat -b 1024 -q 4 -i 5000
 ```
 
 ## Output
