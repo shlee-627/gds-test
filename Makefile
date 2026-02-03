@@ -3,6 +3,8 @@
 # CUDA compiler
 NVCC = nvcc
 
+CUDA_PATH = /usr/local/cuda
+
 # CUDA architecture (adjust based on your GPU)
 # Common values:
 #   - sm_70 for V100
@@ -13,16 +15,16 @@ NVCC = nvcc
 CUDA_ARCH = sm_80
 
 # Compiler flags
-NVCC_FLAGS = -arch=$(CUDA_ARCH) -O3 -std=c++11
+NVCC_FLAGS = -arch=$(CUDA_ARCH) -O3
 NVCC_FLAGS_GDS = $(NVCC_FLAGS) -DUSE_CUFILE
 
 # Libraries
 LIBS =
-LIBS_GDS = -lcufile
+LIBS_GDS = -lcufile -lcuda -L$(CUDA_PATH)/lib64
 
 # Include paths (adjust if needed)
 INCLUDE =
-INCLUDE_GDS = -I/usr/local/cuda/targets/x86_64-linux/include
+INCLUDE_GDS = -I/usr/local/cuda/include/
 
 # Output binaries
 TARGET_ORIGINAL = gds_test
