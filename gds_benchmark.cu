@@ -331,9 +331,11 @@ BenchmarkStats benchmarkTraditional(const BenchmarkConfig& config) {
         lseek(fd, offsets[i % offsets.size()], SEEK_SET);
         if (config.isWrite) {
             CHECK_CUDA(cudaMemcpy(h_buffer, d_buffer, config.blockSize, cudaMemcpyDeviceToHost));
-            write(fd, h_buffer, config.blockSize);
+            ssize_t ret = write(fd, h_buffer, config.blockSize);
+            (void)ret;  // Suppress warning - warmup phase
         } else {
-            read(fd, h_buffer, config.blockSize);
+            ssize_t ret = read(fd, h_buffer, config.blockSize);
+            (void)ret;  // Suppress warning - warmup phase
             CHECK_CUDA(cudaMemcpy(d_buffer, h_buffer, config.blockSize, cudaMemcpyHostToDevice));
         }
     }
@@ -347,11 +349,12 @@ BenchmarkStats benchmarkTraditional(const BenchmarkConfig& config) {
 
         lseek(fd, offsets[i], SEEK_SET);
 
+        ssize_t ret;
         if (config.isWrite) {
             CHECK_CUDA(cudaMemcpy(h_buffer, d_buffer, config.blockSize, cudaMemcpyDeviceToHost));
-            write(fd, h_buffer, config.blockSize);
+            ret = write(fd, h_buffer, config.blockSize);
         } else {
-            read(fd, h_buffer, config.blockSize);
+            ret = read(fd, h_buffer, config.blockSize);
             CHECK_CUDA(cudaMemcpy(d_buffer, h_buffer, config.blockSize, cudaMemcpyHostToDevice));
         }
 
@@ -362,6 +365,11 @@ BenchmarkStats benchmarkTraditional(const BenchmarkConfig& config) {
 
         stats.latencies.push_back(latency_us);
         stats.totalBytes += config.blockSize;
+
+        if (ret < 0) {
+            fprintf(stderr, "I/O error at iteration %d\n", i);
+            break;
+        }
     }
 
     stats.totalTime = getTime() - totalStart;
