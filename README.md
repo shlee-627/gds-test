@@ -99,6 +99,7 @@ Options:
   -b, --block SIZE        Block size in KB (default: test all sizes)
   -q, --queue DEPTH       Queue depth (default: 1)
   -i, --iterations NUM    Number of iterations per test (default: auto)
+  -p, --pattern PATTERN   I/O pattern: random, sequential, or both (default: both)
 ```
 
 ### Examples
@@ -108,7 +109,7 @@ Options:
 ./gds_benchmark --help
 ```
 
-**Default (4GB file, all block sizes)**:
+**Default (4GB file, all block sizes, both patterns)**:
 ```bash
 ./gds_benchmark
 ```
@@ -118,24 +119,39 @@ Options:
 ./gds_benchmark -s 8
 ```
 
+**Test only sequential I/O**:
+```bash
+./gds_benchmark -p sequential
+```
+
+**Test only random I/O**:
+```bash
+./gds_benchmark -p random
+```
+
+**Test sequential I/O with specific block size**:
+```bash
+./gds_benchmark -p sequential -b 4096
+```
+
 **Custom file size and path**:
 ```bash
 ./gds_benchmark -s 8 -f /mnt/nvme0/benchmark.dat
 ```
 
-**Test specific block size (4MB only)**:
+**Test specific block size (4MB only, both patterns)**:
 ```bash
 ./gds_benchmark -b 4096
 ```
 
-**Test 64KB blocks with 10000 iterations**:
+**Test 64KB blocks with 10000 iterations (random only)**:
 ```bash
-./gds_benchmark -b 64 -i 10000
+./gds_benchmark -b 64 -i 10000 -p random
 ```
 
 **Full custom configuration**:
 ```bash
-./gds_benchmark -s 8 -f /nvme/test.dat -b 1024 -q 4 -i 5000
+./gds_benchmark -s 8 -f /nvme/test.dat -b 1024 -p sequential -i 5000
 ```
 
 ## Output
@@ -189,10 +205,21 @@ Results are automatically saved to `gds_benchmark_results.csv` with columns:
 
 The benchmark runs the following tests for each block size:
 
+### Random I/O Tests (when `-p random` or `-p both`)
 1. **GDS Random Read**: Direct GPU-to-Storage read with random access
-2. **Traditional Random Read**: CPU-mediated read (GPU → CPU → Storage)
+2. **Traditional Random Read**: CPU-mediated read (Storage → CPU → GPU)
 3. **GDS Random Write**: Direct GPU-to-Storage write with random access
-4. **Traditional Random Write**: CPU-mediated write (Storage → CPU → GPU)
+4. **Traditional Random Write**: CPU-mediated write (GPU → CPU → Storage)
+
+### Sequential I/O Tests (when `-p sequential` or `-p both`)
+5. **GDS Sequential Read**: Direct GPU-to-Storage read with sequential access
+6. **Traditional Sequential Read**: CPU-mediated sequential read
+7. **GDS Sequential Write**: Direct GPU-to-Storage write with sequential access
+8. **Traditional Sequential Write**: CPU-mediated sequential write
+
+### I/O Pattern Differences
+- **Random Access**: Reads/writes from random file offsets (simulates database/metadata workloads)
+- **Sequential Access**: Reads/writes data sequentially from start (simulates large data transfers, ML model loading)
 
 ### Block Sizes Tested
 - 4 KB
@@ -204,6 +231,11 @@ The benchmark runs the following tests for each block size:
 - 16 MB
 - 64 MB
 - 128 MB
+
+### Performance Expectations
+- **Sequential I/O**: Typically achieves higher throughput, especially for large block sizes
+- **Random I/O**: More latency-sensitive, benefits more from GDS at smaller block sizes
+- **GDS Advantage**: Most pronounced for large transfers and when CPU is a bottleneck
 
 ## Performance Tips
 

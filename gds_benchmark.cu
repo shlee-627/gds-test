@@ -397,17 +397,21 @@ void printHelp(const char* programName) {
     printf("  -q, --queue DEPTH       Queue depth (default: 1)\n");
     printf("                          Note: Currently single-threaded, QD>1 for future use\n");
     printf("  -i, --iterations NUM    Number of iterations per test (default: auto)\n");
+    printf("  -p, --pattern PATTERN   I/O pattern: random, sequential, or both (default: both)\n");
+    printf("                          Examples: random, sequential, both\n");
     printf("\n");
     printf("Block Size Presets:\n");
     printf("  If -b is not specified, tests all sizes: 4KB, 16KB, 64KB, 256KB,\n");
     printf("  1MB, 4MB, 16MB, 64MB, 128MB\n");
     printf("\n");
     printf("Examples:\n");
-    printf("  %s                           # Run with defaults\n", programName);
+    printf("  %s                           # Run with defaults (both patterns)\n", programName);
     printf("  %s -s 8                      # 8GB test file\n", programName);
     printf("  %s -s 4 -f /nvme/test.dat    # Custom file path\n", programName);
     printf("  %s -b 4096                   # Test only 4MB block size\n", programName);
     printf("  %s -b 64 -i 10000            # 64KB blocks, 10000 iterations\n", programName);
+    printf("  %s -p sequential             # Test only sequential I/O\n", programName);
+    printf("  %s -p random -b 4            # Test only random I/O with 4KB blocks\n", programName);
     printf("  %s -s 8 -b 1024 -q 4         # 8GB file, 1MB blocks, QD=4\n", programName);
     printf("\n");
     printf("Output:\n");
@@ -445,6 +449,7 @@ int main(int argc, char** argv) {
     int customBlockSize = -1;  // -1 means test all sizes
     int queueDepth = 1;
     int customIterations = -1;  // -1 means auto-calculate
+    const char* pattern = "both";  // "random", "sequential", or "both"
 
     // Parse command-line arguments
     for (int i = 1; i < argc; i++) {
@@ -486,6 +491,19 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "Error: -i/--iterations requires an argument\n");
                 return 1;
             }
+        } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--pattern") == 0) {
+            if (i + 1 < argc) {
+                pattern = argv[++i];
+                if (strcmp(pattern, "random") != 0 &&
+                    strcmp(pattern, "sequential") != 0 &&
+                    strcmp(pattern, "both") != 0) {
+                    fprintf(stderr, "Error: pattern must be 'random', 'sequential', or 'both'\n");
+                    return 1;
+                }
+            } else {
+                fprintf(stderr, "Error: -p/--pattern requires an argument\n");
+                return 1;
+            }
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             fprintf(stderr, "Use -h or --help for usage information\n");
@@ -520,12 +538,17 @@ int main(int argc, char** argv) {
         printf("  Block Sizes: 4KB to 128MB (9 sizes)\n");
     }
     printf("  Queue Depth: %d\n", queueDepth);
+    printf("  I/O Pattern: %s\n", pattern);
     if (customIterations > 0) {
         printf("  Iterations: %d\n", customIterations);
     } else {
         printf("  Iterations: Auto (min 100, max 10000)\n");
     }
     printf("\n");
+
+    // Determine which patterns to test
+    bool testRandom = (strcmp(pattern, "random") == 0 || strcmp(pattern, "both") == 0);
+    bool testSequential = (strcmp(pattern, "sequential") == 0 || strcmp(pattern, "both") == 0);
 
     // Create test file
     createTestFile(filename, fileSize);
@@ -573,82 +596,166 @@ int main(int argc, char** argv) {
         printf("Block Size: %zu KB\n", blockSize / 1024);
         printf("========================================\n");
 
-        // Test 1: GDS Random Read
-        {
-            BenchmarkConfig config = {
-                fileSize, blockSize, queueDepth, iterations, filename, false, true
-            };
-            BenchmarkStats stats = benchmarkGDS(config);
-            calculateStats(stats, config, pcieBandwidth);
-            printStats(stats, config, "GDS Random Read");
+        // Random I/O Tests
+        if (testRandom) {
+            // Test 1: GDS Random Read
+            {
+                BenchmarkConfig config = {
+                    fileSize, blockSize, queueDepth, iterations, filename, false, true
+                };
+                BenchmarkStats stats = benchmarkGDS(config);
+                calculateStats(stats, config, pcieBandwidth);
+                printStats(stats, config, "GDS Random Read");
 
-            if (csvFile) {
-                fprintf(csvFile, "GDS,Read,Random,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
-                        blockSize/1024, queueDepth, iterations, stats.minLatency, stats.avgLatency,
-                        stats.p50Latency, stats.p95Latency, stats.p99Latency, stats.p999Latency,
-                        stats.maxLatency, stats.throughput, stats.iops, stats.bandwidthUtil, stats.totalTime);
+                if (csvFile) {
+                    fprintf(csvFile, "GDS,Read,Random,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
+                            blockSize/1024, queueDepth, iterations, stats.minLatency, stats.avgLatency,
+                            stats.p50Latency, stats.p95Latency, stats.p99Latency, stats.p999Latency,
+                            stats.maxLatency, stats.throughput, stats.iops, stats.bandwidthUtil, stats.totalTime);
+                }
+            }
+
+            // Test 2: Traditional Random Read
+            {
+                BenchmarkConfig config = {
+                    fileSize, blockSize, queueDepth, iterations, filename, false, true
+                };
+                BenchmarkStats stats = benchmarkTraditional(config);
+                calculateStats(stats, config, pcieBandwidth);
+                printStats(stats, config, "Traditional Random Read");
+
+                if (csvFile) {
+                    fprintf(csvFile, "Traditional,Read,Random,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
+                            blockSize/1024, queueDepth, iterations, stats.minLatency, stats.avgLatency,
+                            stats.p50Latency, stats.p95Latency, stats.p99Latency, stats.p999Latency,
+                            stats.maxLatency, stats.throughput, stats.iops, stats.bandwidthUtil, stats.totalTime);
+                }
+            }
+
+            // Test 3: GDS Random Write
+            {
+                const char* writeFile = "/mnt/tmp/gds_benchmark_write_random.dat";
+                createTestFile(writeFile, fileSize);
+
+                BenchmarkConfig config = {
+                    fileSize, blockSize, queueDepth, iterations, writeFile, true, true
+                };
+                BenchmarkStats stats = benchmarkGDS(config);
+                calculateStats(stats, config, pcieBandwidth);
+                printStats(stats, config, "GDS Random Write");
+
+                if (csvFile) {
+                    fprintf(csvFile, "GDS,Write,Random,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
+                            blockSize/1024, queueDepth, iterations, stats.minLatency, stats.avgLatency,
+                            stats.p50Latency, stats.p95Latency, stats.p99Latency, stats.p999Latency,
+                            stats.maxLatency, stats.throughput, stats.iops, stats.bandwidthUtil, stats.totalTime);
+                }
+
+                unlink(writeFile);
+            }
+
+            // Test 4: Traditional Random Write
+            {
+                const char* writeFile = "/mnt/tmp/gds_benchmark_write_trad_random.dat";
+                createTestFile(writeFile, fileSize);
+
+                BenchmarkConfig config = {
+                    fileSize, blockSize, queueDepth, iterations, writeFile, true, true
+                };
+                BenchmarkStats stats = benchmarkTraditional(config);
+                calculateStats(stats, config, pcieBandwidth);
+                printStats(stats, config, "Traditional Random Write");
+
+                if (csvFile) {
+                    fprintf(csvFile, "Traditional,Write,Random,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
+                            blockSize/1024, queueDepth, iterations, stats.minLatency, stats.avgLatency,
+                            stats.p50Latency, stats.p95Latency, stats.p99Latency, stats.p999Latency,
+                            stats.maxLatency, stats.throughput, stats.iops, stats.bandwidthUtil, stats.totalTime);
+                }
+
+                unlink(writeFile);
             }
         }
 
-        // Test 2: Traditional Random Read
-        {
-            BenchmarkConfig config = {
-                fileSize, blockSize, queueDepth, iterations, filename, false, true
-            };
-            BenchmarkStats stats = benchmarkTraditional(config);
-            calculateStats(stats, config, pcieBandwidth);
-            printStats(stats, config, "Traditional Random Read");
+        // Sequential I/O Tests
+        if (testSequential) {
+            // Test 5: GDS Sequential Read
+            {
+                BenchmarkConfig config = {
+                    fileSize, blockSize, queueDepth, iterations, filename, false, false
+                };
+                BenchmarkStats stats = benchmarkGDS(config);
+                calculateStats(stats, config, pcieBandwidth);
+                printStats(stats, config, "GDS Sequential Read");
 
-            if (csvFile) {
-                fprintf(csvFile, "Traditional,Read,Random,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
-                        blockSize/1024, queueDepth, iterations, stats.minLatency, stats.avgLatency,
-                        stats.p50Latency, stats.p95Latency, stats.p99Latency, stats.p999Latency,
-                        stats.maxLatency, stats.throughput, stats.iops, stats.bandwidthUtil, stats.totalTime);
-            }
-        }
-
-        // Test 3: GDS Random Write
-        {
-            const char* writeFile = "/mnt/tmp/gds_benchmark_write.dat";
-            createTestFile(writeFile, fileSize);
-
-            BenchmarkConfig config = {
-                fileSize, blockSize, queueDepth, iterations, writeFile, true, true
-            };
-            BenchmarkStats stats = benchmarkGDS(config);
-            calculateStats(stats, config, pcieBandwidth);
-            printStats(stats, config, "GDS Random Write");
-
-            if (csvFile) {
-                fprintf(csvFile, "GDS,Write,Random,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
-                        blockSize/1024, queueDepth, iterations, stats.minLatency, stats.avgLatency,
-                        stats.p50Latency, stats.p95Latency, stats.p99Latency, stats.p999Latency,
-                        stats.maxLatency, stats.throughput, stats.iops, stats.bandwidthUtil, stats.totalTime);
+                if (csvFile) {
+                    fprintf(csvFile, "GDS,Read,Sequential,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
+                            blockSize/1024, queueDepth, iterations, stats.minLatency, stats.avgLatency,
+                            stats.p50Latency, stats.p95Latency, stats.p99Latency, stats.p999Latency,
+                            stats.maxLatency, stats.throughput, stats.iops, stats.bandwidthUtil, stats.totalTime);
+                }
             }
 
-            unlink(writeFile);
-        }
+            // Test 6: Traditional Sequential Read
+            {
+                BenchmarkConfig config = {
+                    fileSize, blockSize, queueDepth, iterations, filename, false, false
+                };
+                BenchmarkStats stats = benchmarkTraditional(config);
+                calculateStats(stats, config, pcieBandwidth);
+                printStats(stats, config, "Traditional Sequential Read");
 
-        // Test 4: Traditional Random Write
-        {
-            const char* writeFile = "/mnt/tmp/gds_benchmark_write_trad.dat";
-            createTestFile(writeFile, fileSize);
-
-            BenchmarkConfig config = {
-                fileSize, blockSize, queueDepth, iterations, writeFile, true, true
-            };
-            BenchmarkStats stats = benchmarkTraditional(config);
-            calculateStats(stats, config, pcieBandwidth);
-            printStats(stats, config, "Traditional Random Write");
-
-            if (csvFile) {
-                fprintf(csvFile, "Traditional,Write,Random,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
-                        blockSize/1024, queueDepth, iterations, stats.minLatency, stats.avgLatency,
-                        stats.p50Latency, stats.p95Latency, stats.p99Latency, stats.p999Latency,
-                        stats.maxLatency, stats.throughput, stats.iops, stats.bandwidthUtil, stats.totalTime);
+                if (csvFile) {
+                    fprintf(csvFile, "Traditional,Read,Sequential,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
+                            blockSize/1024, queueDepth, iterations, stats.minLatency, stats.avgLatency,
+                            stats.p50Latency, stats.p95Latency, stats.p99Latency, stats.p999Latency,
+                            stats.maxLatency, stats.throughput, stats.iops, stats.bandwidthUtil, stats.totalTime);
+                }
             }
 
-            unlink(writeFile);
+            // Test 7: GDS Sequential Write
+            {
+                const char* writeFile = "/mnt/tmp/gds_benchmark_write_seq.dat";
+                createTestFile(writeFile, fileSize);
+
+                BenchmarkConfig config = {
+                    fileSize, blockSize, queueDepth, iterations, writeFile, true, false
+                };
+                BenchmarkStats stats = benchmarkGDS(config);
+                calculateStats(stats, config, pcieBandwidth);
+                printStats(stats, config, "GDS Sequential Write");
+
+                if (csvFile) {
+                    fprintf(csvFile, "GDS,Write,Sequential,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
+                            blockSize/1024, queueDepth, iterations, stats.minLatency, stats.avgLatency,
+                            stats.p50Latency, stats.p95Latency, stats.p99Latency, stats.p999Latency,
+                            stats.maxLatency, stats.throughput, stats.iops, stats.bandwidthUtil, stats.totalTime);
+                }
+
+                unlink(writeFile);
+            }
+
+            // Test 8: Traditional Sequential Write
+            {
+                const char* writeFile = "/mnt/tmp/gds_benchmark_write_trad_seq.dat";
+                createTestFile(writeFile, fileSize);
+
+                BenchmarkConfig config = {
+                    fileSize, blockSize, queueDepth, iterations, writeFile, true, false
+                };
+                BenchmarkStats stats = benchmarkTraditional(config);
+                calculateStats(stats, config, pcieBandwidth);
+                printStats(stats, config, "Traditional Sequential Write");
+
+                if (csvFile) {
+                    fprintf(csvFile, "Traditional,Write,Sequential,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
+                            blockSize/1024, queueDepth, iterations, stats.minLatency, stats.avgLatency,
+                            stats.p50Latency, stats.p95Latency, stats.p99Latency, stats.p999Latency,
+                            stats.maxLatency, stats.throughput, stats.iops, stats.bandwidthUtil, stats.totalTime);
+                }
+
+                unlink(writeFile);
+            }
         }
     }
 
