@@ -7,7 +7,8 @@ A comprehensive benchmark suite for analyzing latency and throughput of GPU Dire
 - **Latency Analysis**: Measures per-operation latency with percentile statistics (P50, P95, P99, P99.9)
 - **Throughput Measurement**: Calculates bandwidth (GB/s) and IOPS
 - **Multiple Block Sizes**: Tests from 4KB to 128MB to cover different workload patterns
-- **Random I/O Patterns**: Simulates real-world random access patterns
+- **I/O Patterns**: Both random and sequential access patterns
+- **Asynchronous I/O**: True async I/O with configurable queue depth (like FIO with libaio)
 - **Comparison**: Compares GDS vs traditional CPU-mediated I/O
 - **CSV Export**: Outputs detailed results for further analysis
 - **PCIe Utilization**: Shows percentage of theoretical PCIe bandwidth utilized
@@ -97,7 +98,8 @@ Options:
   -s, --size SIZE         File size in GB (default: 4)
   -f, --file PATH         Test file path (default: /mnt/tmp/gds_benchmark.dat)
   -b, --block SIZE        Block size in KB (default: test all sizes)
-  -q, --queue DEPTH       Queue depth (default: 1)
+  -q, --queue DEPTH       Queue depth for async I/O (default: 1)
+                          QD=1: Synchronous I/O, QD>1: Asynchronous I/O
   -i, --iterations NUM    Number of iterations per test (default: auto)
   -p, --pattern PATTERN   I/O pattern: random, sequential, or both (default: both)
 ```
@@ -149,9 +151,28 @@ Options:
 ./gds_benchmark -b 64 -i 10000 -p random
 ```
 
+**Test with async I/O (queue depth 16)**:
+```bash
+./gds_benchmark -q 16
+```
+
+**High-performance async test**:
+```bash
+./gds_benchmark -b 4096 -q 32 -p sequential
+```
+
+**Compare sync vs async (4MB blocks)**:
+```bash
+# Synchronous (QD=1)
+./gds_benchmark -b 4096 -q 1
+
+# Asynchronous (QD=32)
+./gds_benchmark -b 4096 -q 32
+```
+
 **Full custom configuration**:
 ```bash
-./gds_benchmark -s 8 -f /nvme/test.dat -b 1024 -p sequential -i 5000
+./gds_benchmark -s 8 -f /nvme/test.dat -b 1024 -p sequential -q 16 -i 5000
 ```
 
 ## Output
@@ -236,6 +257,53 @@ The benchmark runs the following tests for each block size:
 - **Sequential I/O**: Typically achieves higher throughput, especially for large block sizes
 - **Random I/O**: More latency-sensitive, benefits more from GDS at smaller block sizes
 - **GDS Advantage**: Most pronounced for large transfers and when CPU is a bottleneck
+
+## Asynchronous I/O (Queue Depth)
+
+The benchmark supports true asynchronous I/O using the **cuFile Batch API**, similar to FIO with `libaio` engine.
+
+### How It Works
+
+**Synchronous (QD=1 - default)**:
+- Issues one I/O operation at a time
+- Waits for completion before submitting the next
+- Good for latency analysis
+- Lower throughput
+
+**Asynchronous Batch API (QD>1)**:
+- Uses `cuFileBatchIOSubmit` and `cuFileBatchIOGetStatus`
+- Submits multiple operations in a single batch
+- Minimal API overhead
+- GDS driver optimizes the entire batch
+- Much higher throughput and IOPS
+- Better utilizes storage and PCIe bandwidth
+
+### Batch API vs Individual Calls
+
+The benchmark automatically switches between:
+- **QD=1**: Individual `cuFileRead`/`cuFileWrite` calls (synchronous)
+- **QD>1**: `cuFileBatchIOSubmit` API (true async batch)
+
+### Queue Depth Guidelines
+
+| Queue Depth | Use Case | Expected Behavior |
+|-------------|----------|-------------------|
+| **QD=1** | Latency measurement | Pure latency, no parallelism |
+| **QD=4-8** | Balanced workload | Good balance of latency and throughput |
+| **QD=16-32** | Maximum throughput | Saturates storage bandwidth |
+| **QD=64+** | Extreme scenarios | May show diminishing returns |
+
+### Example: Impact of Queue Depth
+
+```bash
+# Low latency, low throughput
+./gds_benchmark -b 4096 -q 1
+# Expected: ~15 GB/s, low IOPS
+
+# High throughput, higher latency
+./gds_benchmark -b 4096 -q 32
+# Expected: ~60 GB/s (on Gen4), high IOPS
+```
 
 ## Performance Tips
 

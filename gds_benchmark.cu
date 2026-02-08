@@ -280,6 +280,395 @@ BenchmarkStats benchmarkGDS(const BenchmarkConfig& config) {
     return stats;
 }
 
+// GDS Benchmark - True Batch API (most efficient for QD > 1)
+BenchmarkStats benchmarkGDSBatch(const BenchmarkConfig& config) {
+    BenchmarkStats stats = {};
+    CUfileError_t status;
+    CUfileDescr_t cf_descr;
+    CUfileHandle_t cf_handle;
+
+    // Initialize cuFile
+    status = cuFileDriverOpen();
+    if (status.err != CU_FILE_SUCCESS) {
+        fprintf(stderr, "cuFile driver open failed: %d\n", status.err);
+        return stats;
+    }
+
+    // Allocate GPU memory for all in-flight operations
+    char** d_buffers = new char*[config.queueDepth];
+    for (int i = 0; i < config.queueDepth; i++) {
+        CHECK_CUDA(cudaMalloc(&d_buffers[i], config.blockSize));
+        if (config.isWrite) {
+            CHECK_CUDA(cudaMemset(d_buffers[i], 0xCD, config.blockSize));
+        }
+    }
+
+    // Open file
+    int flags = config.isWrite ? (O_WRONLY | O_CREAT | O_DIRECT) : (O_RDONLY | O_DIRECT);
+    int fd = open(config.filename, flags, 0644);
+    if (fd < 0) {
+        perror("Failed to open file with O_DIRECT");
+        for (int i = 0; i < config.queueDepth; i++) {
+            cudaFree(d_buffers[i]);
+        }
+        delete[] d_buffers;
+        cuFileDriverClose();
+        return stats;
+    }
+
+    // Register cuFile handle
+    memset(&cf_descr, 0, sizeof(CUfileDescr_t));
+    cf_descr.handle.fd = fd;
+    cf_descr.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
+
+    status = cuFileHandleRegister(&cf_handle, &cf_descr);
+    if (status.err != CU_FILE_SUCCESS) {
+        fprintf(stderr, "cuFile handle register failed: %d\n", status.err);
+        close(fd);
+        for (int i = 0; i < config.queueDepth; i++) {
+            cudaFree(d_buffers[i]);
+        }
+        delete[] d_buffers;
+        cuFileDriverClose();
+        return stats;
+    }
+
+    // Prepare random offsets
+    std::vector<off_t> offsets;
+    size_t maxOffset = (config.fileSize / config.blockSize) * config.blockSize;
+
+    if (config.isRandom) {
+        srand(12345);
+        for (int i = 0; i < config.numIterations; i++) {
+            off_t offset = (rand() % (maxOffset / config.blockSize)) * config.blockSize;
+            offsets.push_back(offset);
+        }
+    } else {
+        for (int i = 0; i < config.numIterations; i++) {
+            off_t offset = (i * config.blockSize) % maxOffset;
+            offsets.push_back(offset);
+        }
+    }
+
+    // Warmup - Skip several initial I/O requests (To avoid out-liers)
+    for (int i = 0; i < 10; i++) {
+        if (config.isWrite) {
+            cuFileWrite(cf_handle, d_buffers[0], config.blockSize, offsets[i % offsets.size()], 0);
+        } else {
+            cuFileRead(cf_handle, d_buffers[0], config.blockSize, offsets[i % offsets.size()], 0);
+        }
+    }
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    // Setup batch I/O structures
+    CUfileIOParams_t* io_batch = new CUfileIOParams_t[config.queueDepth];
+    CUfileIOEvents_t* io_events = new CUfileIOEvents_t[config.queueDepth];
+
+    // Initialize batch parameters
+    for (int i = 0; i < config.queueDepth; i++) {
+        memset(&io_batch[i], 0, sizeof(CUfileIOParams_t));
+        io_batch[i].mode = CUFILE_BATCH;
+        io_batch[i].fh = cf_handle;
+        io_batch[i].u.batch.devPtr_base = d_buffers[i];
+        io_batch[i].u.batch.devPtr_offset = 0;
+        io_batch[i].u.batch.size = config.blockSize;
+        io_batch[i].opcode = config.isWrite ? CUFILE_WRITE : CUFILE_READ;
+        io_batch[i].cookie = (void*)(uintptr_t)i;  // Track which slot
+    }
+
+    // Tracking structures
+    struct BatchOp {
+        int slotId;
+        double startTime;
+        bool active;
+    };
+
+    std::vector<BatchOp> inFlightOps(config.queueDepth);
+    for (int i = 0; i < config.queueDepth; i++) {
+        inFlightOps[i].slotId = i;
+        inFlightOps[i].active = false;
+    }
+
+    int nextOp = 0;
+    int completedOps = 0;
+
+    // Pre-allocate submit batch buffer (avoid new/delete in hot path)
+    CUfileIOParams_t* submitBatch = new CUfileIOParams_t[config.queueDepth];
+
+    double totalStart = getTime();
+
+    // Main batch I/O loop - optimized for maximum IOPS
+    while (completedOps < config.numIterations) {
+        // Prepare batch for submission
+        int batchSize = 0;
+
+        for (int i = 0; i < config.queueDepth && nextOp < config.numIterations; i++) {
+            if (!inFlightOps[i].active) {
+                int slotId = i;
+
+                // Setup this batch entry
+                io_batch[slotId].u.batch.file_offset = offsets[nextOp];
+
+                // Record start time
+                inFlightOps[slotId].startTime = getTime();
+                inFlightOps[slotId].active = true;
+
+                submitBatch[batchSize++] = io_batch[slotId];
+                nextOp++;
+            }
+        }
+
+        // Submit batch if we have operations
+        if (batchSize > 0) {
+            // Submit the batch (non-blocking)
+            status = cuFileBatchIOSubmit(batchSize, submitBatch, 0);
+            if (status.err != CU_FILE_SUCCESS) {
+                fprintf(stderr, "Batch submit failed: %d\n", status.err);
+                break;
+            }
+        }
+
+        // Poll for completions
+        int numEvents = config.queueDepth;
+        status = cuFileBatchIOGetStatus(config.queueDepth, io_events, &numEvents, 0);
+
+        if (status.err == CU_FILE_SUCCESS || status.err == CU_FILE_WAITING) {
+            for (int i = 0; i < numEvents; i++) {
+                if (io_events[i].status == CUFILE_COMPLETE) {
+                    int slotId = (int)(uintptr_t)io_events[i].cookie;
+
+                    if (inFlightOps[slotId].active) {
+                        double endTime = getTime();
+                        double latency_us = (endTime - inFlightOps[slotId].startTime) * 1e6;
+
+                        stats.latencies.push_back(latency_us);
+                        stats.totalBytes += config.blockSize;
+
+                        inFlightOps[slotId].active = false;
+                        completedOps++;
+                    }
+                }
+            }
+        }
+
+        // Busy poll for maximum IOPS (no sleep)
+        // Note: This uses 100% CPU. For lower CPU usage, add: usleep(1);
+    }
+
+    // Cleanup pre-allocated buffer
+    delete[] submitBatch;
+
+    // Wait for all remaining operations
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    stats.totalTime = getTime() - totalStart;
+
+    // Cleanup
+    delete[] io_batch;
+    delete[] io_events;
+
+    cuFileHandleDeregister(cf_handle);
+    close(fd);
+
+    for (int i = 0; i < config.queueDepth; i++) {
+        CHECK_CUDA(cudaFree(d_buffers[i]));
+    }
+    delete[] d_buffers;
+
+    cuFileDriverClose();
+
+    return stats;
+}
+
+// GDS Benchmark - Asynchronous with batch API for queue depth > 1
+BenchmarkStats benchmarkGDSAsync(const BenchmarkConfig& config) {
+    BenchmarkStats stats = {};
+    CUfileError_t status;
+    CUfileDescr_t cf_descr;
+    CUfileHandle_t cf_handle;
+
+    // Initialize cuFile
+    status = cuFileDriverOpen();
+    if (status.err != CU_FILE_SUCCESS) {
+        fprintf(stderr, "cuFile driver open failed: %d\n", status.err);
+        return stats;
+    }
+
+    // Allocate GPU memory for all in-flight operations
+    char** d_buffers = new char*[config.queueDepth];
+    for (int i = 0; i < config.queueDepth; i++) {
+        CHECK_CUDA(cudaMalloc(&d_buffers[i], config.blockSize));
+        if (config.isWrite) {
+            CHECK_CUDA(cudaMemset(d_buffers[i], 0xCD, config.blockSize));
+        }
+    }
+
+    // Create CUDA streams for async operations
+    cudaStream_t* streams = new cudaStream_t[config.queueDepth];
+    for (int i = 0; i < config.queueDepth; i++) {
+        CHECK_CUDA(cudaStreamCreate(&streams[i]));
+    }
+
+    // Open file
+    int flags = config.isWrite ? (O_WRONLY | O_CREAT | O_DIRECT) : (O_RDONLY | O_DIRECT);
+    int fd = open(config.filename, flags, 0644);
+    if (fd < 0) {
+        perror("Failed to open file with O_DIRECT");
+        for (int i = 0; i < config.queueDepth; i++) {
+            cudaFree(d_buffers[i]);
+            cudaStreamDestroy(streams[i]);
+        }
+        delete[] d_buffers;
+        delete[] streams;
+        cuFileDriverClose();
+        return stats;
+    }
+
+    // Register cuFile handle
+    memset(&cf_descr, 0, sizeof(CUfileDescr_t));
+    cf_descr.handle.fd = fd;
+    cf_descr.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
+
+    status = cuFileHandleRegister(&cf_handle, &cf_descr);
+    if (status.err != CU_FILE_SUCCESS) {
+        fprintf(stderr, "cuFile handle register failed: %d\n", status.err);
+        close(fd);
+        for (int i = 0; i < config.queueDepth; i++) {
+            cudaFree(d_buffers[i]);
+            cudaStreamDestroy(streams[i]);
+        }
+        delete[] d_buffers;
+        delete[] streams;
+        cuFileDriverClose();
+        return stats;
+    }
+
+    // Prepare random offsets
+    std::vector<off_t> offsets;
+    size_t maxOffset = (config.fileSize / config.blockSize) * config.blockSize;
+
+    if (config.isRandom) {
+        srand(12345);
+        for (int i = 0; i < config.numIterations; i++) {
+            off_t offset = (rand() % (maxOffset / config.blockSize)) * config.blockSize;
+            offsets.push_back(offset);
+        }
+    } else {
+        for (int i = 0; i < config.numIterations; i++) {
+            off_t offset = (i * config.blockSize) % maxOffset;
+            offsets.push_back(offset);
+        }
+    }
+
+    // Warmup
+    for (int i = 0; i < 10; i++) {
+        if (config.isWrite) {
+            cuFileWrite(cf_handle, d_buffers[0], config.blockSize, offsets[i % offsets.size()], 0);
+        } else {
+            cuFileRead(cf_handle, d_buffers[0], config.blockSize, offsets[i % offsets.size()], 0);
+        }
+    }
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    // Tracking structures for async operations
+    struct AsyncOp {
+        int slotId;
+        double startTime;
+        bool active;
+    };
+
+    std::vector<AsyncOp> inFlightOps(config.queueDepth);
+    for (int i = 0; i < config.queueDepth; i++) {
+        inFlightOps[i].slotId = i;
+        inFlightOps[i].active = false;
+    }
+
+    int nextOp = 0;           // Next operation to submit
+    int completedOps = 0;     // Number of completed operations
+
+    double totalStart = getTime();
+
+    // Main async I/O loop
+    while (completedOps < config.numIterations) {
+        // Submit new operations to fill queue depth
+        for (int i = 0; i < config.queueDepth && nextOp < config.numIterations; i++) {
+            if (!inFlightOps[i].active) {
+                int slotId = i;
+
+                // Record start time for this operation
+                inFlightOps[slotId].startTime = getTime();
+                inFlightOps[slotId].active = true;
+
+                // Issue async I/O operation
+                ssize_t ret;
+                if (config.isWrite) {
+                    ret = cuFileWrite(cf_handle, d_buffers[slotId], config.blockSize,
+                                     offsets[nextOp], 0);
+                } else {
+                    ret = cuFileRead(cf_handle, d_buffers[slotId], config.blockSize,
+                                    offsets[nextOp], 0);
+                }
+
+                if (ret < 0) {
+                    fprintf(stderr, "cuFile operation failed at iteration %d\n", nextOp);
+                    inFlightOps[slotId].active = false;
+                    break;
+                }
+
+                nextOp++;
+            }
+        }
+
+        // Check for completions (poll)
+        for (int i = 0; i < config.queueDepth; i++) {
+            if (inFlightOps[i].active) {
+                // Query stream status
+                cudaError_t streamStatus = cudaStreamQuery(streams[i]);
+
+                if (streamStatus == cudaSuccess) {
+                    // Operation completed
+                    double endTime = getTime();
+                    double latency_us = (endTime - inFlightOps[i].startTime) * 1e6;
+
+                    stats.latencies.push_back(latency_us);
+                    stats.totalBytes += config.blockSize;
+
+                    inFlightOps[i].active = false;
+                    completedOps++;
+                } else if (streamStatus != cudaErrorNotReady) {
+                    // Error occurred
+                    fprintf(stderr, "CUDA stream error: %s\n", cudaGetErrorString(streamStatus));
+                    inFlightOps[i].active = false;
+                    completedOps++;
+                }
+            }
+        }
+
+        // Small sleep to avoid busy-waiting
+        usleep(1);
+    }
+
+    // Wait for all remaining operations to complete
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    stats.totalTime = getTime() - totalStart;
+
+    // Cleanup
+    cuFileHandleDeregister(cf_handle);
+    close(fd);
+
+    for (int i = 0; i < config.queueDepth; i++) {
+        CHECK_CUDA(cudaFree(d_buffers[i]));
+        CHECK_CUDA(cudaStreamDestroy(streams[i]));
+    }
+    delete[] d_buffers;
+    delete[] streams;
+
+    cuFileDriverClose();
+
+    return stats;
+}
+
 // Traditional I/O benchmark for comparison
 BenchmarkStats benchmarkTraditional(const BenchmarkConfig& config) {
     BenchmarkStats stats = {};
@@ -394,8 +783,9 @@ void printHelp(const char* programName) {
     printf("  -f, --file PATH         Test file path (default: /mnt/tmp/gds_benchmark.dat)\n");
     printf("  -b, --block SIZE        Block size in KB (default: test all sizes)\n");
     printf("                          Examples: 4, 64, 1024, 4096\n");
-    printf("  -q, --queue DEPTH       Queue depth (default: 1)\n");
-    printf("                          Note: Currently single-threaded, QD>1 for future use\n");
+    printf("  -q, --queue DEPTH       Queue depth for async I/O (default: 1)\n");
+    printf("                          QD=1: Synchronous I/O, QD>1: Asynchronous I/O\n");
+    printf("                          Recommended: 4, 8, 16, 32 for high throughput\n");
     printf("  -i, --iterations NUM    Number of iterations per test (default: auto)\n");
     printf("  -p, --pattern PATTERN   I/O pattern: random, sequential, or both (default: both)\n");
     printf("                          Examples: random, sequential, both\n");
@@ -412,7 +802,8 @@ void printHelp(const char* programName) {
     printf("  %s -b 64 -i 10000            # 64KB blocks, 10000 iterations\n", programName);
     printf("  %s -p sequential             # Test only sequential I/O\n", programName);
     printf("  %s -p random -b 4            # Test only random I/O with 4KB blocks\n", programName);
-    printf("  %s -s 8 -b 1024 -q 4         # 8GB file, 1MB blocks, QD=4\n", programName);
+    printf("  %s -q 16                     # Test with async I/O, queue depth 16\n", programName);
+    printf("  %s -s 8 -b 1024 -q 32        # 8GB file, 1MB blocks, QD=32 (async)\n", programName);
     printf("\n");
     printf("Output:\n");
     printf("  - Console: Detailed statistics for each test\n");
@@ -603,9 +994,17 @@ int main(int argc, char** argv) {
                 BenchmarkConfig config = {
                     fileSize, blockSize, queueDepth, iterations, filename, false, true
                 };
-                BenchmarkStats stats = benchmarkGDS(config);
-                calculateStats(stats, config, pcieBandwidth);
-                printStats(stats, config, "GDS Random Read");
+                // Use batch API if queue depth > 1
+                BenchmarkStats stats;
+                if (queueDepth > 1) {
+                    stats = benchmarkGDSBatch(config);
+                    calculateStats(stats, config, pcieBandwidth);
+                    printStats(stats, config, "GDS Random Read (Batch API)");
+                } else {
+                    stats = benchmarkGDS(config);
+                    calculateStats(stats, config, pcieBandwidth);
+                    printStats(stats, config, "GDS Random Read");
+                }
 
                 if (csvFile) {
                     fprintf(csvFile, "GDS,Read,Random,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
@@ -640,9 +1039,17 @@ int main(int argc, char** argv) {
                 BenchmarkConfig config = {
                     fileSize, blockSize, queueDepth, iterations, writeFile, true, true
                 };
-                BenchmarkStats stats = benchmarkGDS(config);
-                calculateStats(stats, config, pcieBandwidth);
-                printStats(stats, config, "GDS Random Write");
+                // Use batch API if queue depth > 1
+                BenchmarkStats stats;
+                if (queueDepth > 1) {
+                    stats = benchmarkGDSBatch(config);
+                    calculateStats(stats, config, pcieBandwidth);
+                    printStats(stats, config, "GDS Random Write (Batch API)");
+                } else {
+                    stats = benchmarkGDS(config);
+                    calculateStats(stats, config, pcieBandwidth);
+                    printStats(stats, config, "GDS Random Write");
+                }
 
                 if (csvFile) {
                     fprintf(csvFile, "GDS,Write,Random,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
@@ -684,9 +1091,17 @@ int main(int argc, char** argv) {
                 BenchmarkConfig config = {
                     fileSize, blockSize, queueDepth, iterations, filename, false, false
                 };
-                BenchmarkStats stats = benchmarkGDS(config);
-                calculateStats(stats, config, pcieBandwidth);
-                printStats(stats, config, "GDS Sequential Read");
+                // Use batch API if queue depth > 1
+                BenchmarkStats stats;
+                if (queueDepth > 1) {
+                    stats = benchmarkGDSBatch(config);
+                    calculateStats(stats, config, pcieBandwidth);
+                    printStats(stats, config, "GDS Sequential Read (Batch API)");
+                } else {
+                    stats = benchmarkGDS(config);
+                    calculateStats(stats, config, pcieBandwidth);
+                    printStats(stats, config, "GDS Sequential Read");
+                }
 
                 if (csvFile) {
                     fprintf(csvFile, "GDS,Read,Sequential,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
@@ -721,9 +1136,17 @@ int main(int argc, char** argv) {
                 BenchmarkConfig config = {
                     fileSize, blockSize, queueDepth, iterations, writeFile, true, false
                 };
-                BenchmarkStats stats = benchmarkGDS(config);
-                calculateStats(stats, config, pcieBandwidth);
-                printStats(stats, config, "GDS Sequential Write");
+                // Use batch API if queue depth > 1
+                BenchmarkStats stats;
+                if (queueDepth > 1) {
+                    stats = benchmarkGDSBatch(config);
+                    calculateStats(stats, config, pcieBandwidth);
+                    printStats(stats, config, "GDS Sequential Write (Batch API)");
+                } else {
+                    stats = benchmarkGDS(config);
+                    calculateStats(stats, config, pcieBandwidth);
+                    printStats(stats, config, "GDS Sequential Write");
+                }
 
                 if (csvFile) {
                     fprintf(csvFile, "GDS,Write,Sequential,%zu,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
