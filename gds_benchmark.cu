@@ -417,6 +417,8 @@ BenchmarkStats benchmarkGDSBatch(const BenchmarkConfig& config) {
     bool timeBasedMode = (config.runtimeSeconds > 0);
     double benchmarkEndTime = totalStart + config.runtimeSeconds;
 
+		printf ("Time-based Mode: %d, benchmarkEndTime: %.4f", timeBasedMode, benchmarkEndTime);
+
     // Main batch I/O loop - optimized for maximum IOPS
     // Time-based: run until time expires
     // Iteration-based: run until numIterations completed
