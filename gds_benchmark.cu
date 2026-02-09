@@ -29,6 +29,7 @@ struct BenchmarkConfig {
     size_t blockSize;
     int queueDepth;
     int numIterations;
+    int runtimeSeconds;      // Time-based mode: run for N seconds (0 = use numIterations)
     const char* filename;
     bool isWrite;
     bool isRandom;
@@ -413,18 +414,41 @@ BenchmarkStats benchmarkGDSBatch(const BenchmarkConfig& config) {
     CUfileIOParams_t* submitBatch = new CUfileIOParams_t[config.queueDepth];
 
     double totalStart = getTime();
+    bool timeBasedMode = (config.runtimeSeconds > 0);
+    double endTime = totalStart + config.runtimeSeconds;
 
     // Main batch I/O loop - optimized for maximum IOPS
-    while (completedOps < config.numIterations) {
+    // Time-based: run until time expires
+    // Iteration-based: run until numIterations completed
+    while (true) {
+        // Check termination condition
+        if (timeBasedMode) {
+            if (getTime() >= endTime) {
+                break;  // Time expired
+            }
+        } else {
+            if (completedOps >= config.numIterations) {
+                break;  // All iterations done
+            }
+        }
+
         // Prepare batch for submission
         int batchSize = 0;
 
-        for (int i = 0; i < config.queueDepth && nextOp < config.numIterations; i++) {
+        for (int i = 0; i < config.queueDepth; i++) {
             if (!inFlightOps[i].active) {
                 int slotId = i;
 
+                // Get next offset (wrap around for time-based mode)
+                int offsetIndex = timeBasedMode ? (nextOp % offsets.size()) : nextOp;
+
+                // Check if we have more iterations to submit (iteration-based only)
+                if (!timeBasedMode && nextOp >= config.numIterations) {
+                    break;
+                }
+
                 // Setup this batch entry
-                io_batch[slotId].u.batch.file_offset = offsets[nextOp];
+                io_batch[slotId].u.batch.file_offset = offsets[offsetIndex];
 
                 // Record start time
                 inFlightOps[slotId].startTime = getTime();
@@ -807,6 +831,8 @@ void printHelp(const char* programName) {
     printf("                          QD=1: Synchronous I/O, QD>1: Asynchronous I/O\n");
     printf("                          Recommended: 4, 8, 16, 32 for high throughput\n");
     printf("  -i, --iterations NUM    Number of iterations per test (default: auto)\n");
+    printf("  -t, --time SECONDS      Time-based mode: run for N seconds (overrides -i)\n");
+    printf("                          Example: -t 30 (run for 30 seconds)\n");
     printf("  -p, --pattern PATTERN   I/O pattern: random, sequential, or both (default: both)\n");
     printf("                          Examples: random, sequential, both\n");
     printf("\n");
@@ -820,6 +846,8 @@ void printHelp(const char* programName) {
     printf("  %s -s 4 -f /nvme/test.dat    # Custom file path\n", programName);
     printf("  %s -b 4096                   # Test only 4MB block size\n", programName);
     printf("  %s -b 64 -i 10000            # 64KB blocks, 10000 iterations\n", programName);
+    printf("  %s -t 30                     # Run for 30 seconds (time-based)\n", programName);
+    printf("  %s -b 4 -q 128 -t 60         # 4KB blocks, QD=128, run 60 seconds\n", programName);
     printf("  %s -p sequential             # Test only sequential I/O\n", programName);
     printf("  %s -p random -b 4            # Test only random I/O with 4KB blocks\n", programName);
     printf("  %s -q 16                     # Test with async I/O, queue depth 16\n", programName);
@@ -860,6 +888,7 @@ int main(int argc, char** argv) {
     int customBlockSize = -1;  // -1 means test all sizes
     int queueDepth = 1;
     int customIterations = -1;  // -1 means auto-calculate
+    int runtimeSeconds = 0;      // 0 means iteration-based, >0 means time-based
     const char* pattern = "both";  // "random", "sequential", or "both"
 
     // Parse command-line arguments
@@ -900,6 +929,17 @@ int main(int argc, char** argv) {
                 customIterations = atoi(argv[++i]);
             } else {
                 fprintf(stderr, "Error: -i/--iterations requires an argument\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--time") == 0) {
+            if (i + 1 < argc) {
+                runtimeSeconds = atoi(argv[++i]);
+                if (runtimeSeconds <= 0) {
+                    fprintf(stderr, "Error: runtime must be > 0\n");
+                    return 1;
+                }
+            } else {
+                fprintf(stderr, "Error: -t/--time requires an argument\n");
                 return 1;
             }
         } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--pattern") == 0) {
@@ -950,10 +990,12 @@ int main(int argc, char** argv) {
     }
     printf("  Queue Depth: %d\n", queueDepth);
     printf("  I/O Pattern: %s\n", pattern);
-    if (customIterations > 0) {
-        printf("  Iterations: %d\n", customIterations);
+    if (runtimeSeconds > 0) {
+        printf("  Mode: Time-based (%d seconds)\n", runtimeSeconds);
+    } else if (customIterations > 0) {
+        printf("  Mode: Iteration-based (%d iterations)\n", customIterations);
     } else {
-        printf("  Iterations: Auto (min 100, max 10000)\n");
+        printf("  Mode: Iteration-based (auto: min 100, max 10000)\n");
     }
     printf("\n");
 
@@ -994,9 +1036,12 @@ int main(int argc, char** argv) {
 
     // Run benchmarks for different block sizes
     for (size_t blockSize : blockSizes) {
-        // Calculate iterations to read at least 1GB of data
+        // Calculate iterations to read at least 1GB of data (ignored in time-based mode)
         int iterations;
-        if (customIterations > 0) {
+        if (runtimeSeconds > 0) {
+            // Time-based mode: use large number for offset array generation
+            iterations = 1000000;  // Generate 1M offsets to cycle through
+        } else if (customIterations > 0) {
             iterations = customIterations;
         } else {
             iterations = std::max(100, (int)(1024*1024*1024 / blockSize));
@@ -1005,6 +1050,11 @@ int main(int argc, char** argv) {
 
         printf("\n" "========================================\n");
         printf("Block Size: %zu KB\n", blockSize / 1024);
+        if (runtimeSeconds > 0) {
+            printf("Mode: Time-based (%d seconds)\n", runtimeSeconds);
+        } else {
+            printf("Mode: Iteration-based (%d iterations)\n", iterations);
+        }
         printf("========================================\n");
 
         // Random I/O Tests
@@ -1012,7 +1062,7 @@ int main(int argc, char** argv) {
             // Test 1: GDS Random Read
             {
                 BenchmarkConfig config = {
-                    fileSize, blockSize, queueDepth, iterations, filename, false, true
+                    fileSize, blockSize, queueDepth, iterations, runtimeSeconds, filename, false, true
                 };
                 // Use batch API if queue depth > 1
                 BenchmarkStats stats;
@@ -1037,7 +1087,7 @@ int main(int argc, char** argv) {
             // Test 2: Traditional Random Read
             {
                 BenchmarkConfig config = {
-                    fileSize, blockSize, queueDepth, iterations, filename, false, true
+                    fileSize, blockSize, queueDepth, iterations, runtimeSeconds, filename, false, true
                 };
                 BenchmarkStats stats = benchmarkTraditional(config);
                 calculateStats(stats, config, pcieBandwidth);
@@ -1057,7 +1107,7 @@ int main(int argc, char** argv) {
                 createTestFile(writeFile, fileSize);
 
                 BenchmarkConfig config = {
-                    fileSize, blockSize, queueDepth, iterations, writeFile, true, true
+                    fileSize, blockSize, queueDepth, iterations, runtimeSeconds, writeFile, true, true
                 };
                 // Use batch API if queue depth > 1
                 BenchmarkStats stats;
@@ -1087,7 +1137,7 @@ int main(int argc, char** argv) {
                 createTestFile(writeFile, fileSize);
 
                 BenchmarkConfig config = {
-                    fileSize, blockSize, queueDepth, iterations, writeFile, true, true
+                    fileSize, blockSize, queueDepth, iterations, runtimeSeconds, writeFile, true, true
                 };
                 BenchmarkStats stats = benchmarkTraditional(config);
                 calculateStats(stats, config, pcieBandwidth);
@@ -1109,7 +1159,7 @@ int main(int argc, char** argv) {
             // Test 5: GDS Sequential Read
             {
                 BenchmarkConfig config = {
-                    fileSize, blockSize, queueDepth, iterations, filename, false, false
+                    fileSize, blockSize, queueDepth, iterations, runtimeSeconds, filename, false, false
                 };
                 // Use batch API if queue depth > 1
                 BenchmarkStats stats;
@@ -1134,7 +1184,7 @@ int main(int argc, char** argv) {
             // Test 6: Traditional Sequential Read
             {
                 BenchmarkConfig config = {
-                    fileSize, blockSize, queueDepth, iterations, filename, false, false
+                    fileSize, blockSize, queueDepth, iterations, runtimeSeconds, filename, false, false
                 };
                 BenchmarkStats stats = benchmarkTraditional(config);
                 calculateStats(stats, config, pcieBandwidth);
@@ -1154,7 +1204,7 @@ int main(int argc, char** argv) {
                 createTestFile(writeFile, fileSize);
 
                 BenchmarkConfig config = {
-                    fileSize, blockSize, queueDepth, iterations, writeFile, true, false
+                    fileSize, blockSize, queueDepth, iterations, runtimeSeconds, writeFile, true, false
                 };
                 // Use batch API if queue depth > 1
                 BenchmarkStats stats;
@@ -1184,7 +1234,7 @@ int main(int argc, char** argv) {
                 createTestFile(writeFile, fileSize);
 
                 BenchmarkConfig config = {
-                    fileSize, blockSize, queueDepth, iterations, writeFile, true, false
+                    fileSize, blockSize, queueDepth, iterations, runtimeSeconds, writeFile, true, false
                 };
                 BenchmarkStats stats = benchmarkTraditional(config);
                 calculateStats(stats, config, pcieBandwidth);
