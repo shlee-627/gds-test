@@ -447,7 +447,7 @@ BenchmarkStats benchmarkGDSBatch(const BenchmarkConfig& config) {
         unsigned int numEvents = config.queueDepth;
         status = cuFileBatchIOGetStatus(batch_handle, 0, &numEvents, io_events, NULL);
 
-        if (status.err == CU_FILE_SUCCESS || status.err == CU_FILE_WAITING) {
+        if (status.err == CU_FILE_SUCCESS) {
             for (int i = 0; i < numEvents; i++) {
                 if (io_events[i].status == CUFILE_COMPLETE) {
                     int slotId = (int)(uintptr_t)io_events[i].cookie;
