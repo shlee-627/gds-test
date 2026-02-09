@@ -102,6 +102,8 @@ void calculateStats(BenchmarkStats& stats, const BenchmarkConfig& config,
 
     // Calculate throughput and IOPS
     stats.throughput = (stats.totalBytes / (1024.0*1024.0*1024.0)) / stats.totalTime;
+
+		printf ("calculateStats: latencies sample size : %d\n", stats.latencies.size());
     stats.iops = stats.latencies.size() / stats.totalTime;
 
     // Calculate bandwidth utilization
