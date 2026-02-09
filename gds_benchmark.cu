@@ -360,6 +360,21 @@ BenchmarkStats benchmarkGDSBatch(const BenchmarkConfig& config) {
     }
     CHECK_CUDA(cudaDeviceSynchronize());
 
+    // Setup batch handle (REQUIRED for Batch API)
+    CUfileBatchHandle_t batch_handle;
+    status = cuFileBatchIOSetUp(&batch_handle, config.queueDepth);
+    if (status.err != CU_FILE_SUCCESS) {
+        fprintf(stderr, "cuFileBatchIOSetUp failed: %d\n", status.err);
+        cuFileHandleDeregister(cf_handle);
+        close(fd);
+        for (int i = 0; i < config.queueDepth; i++) {
+            cudaFree(d_buffers[i]);
+        }
+        delete[] d_buffers;
+        cuFileDriverClose();
+        return stats;
+    }
+
     // Setup batch I/O structures
     CUfileIOParams_t* io_batch = new CUfileIOParams_t[config.queueDepth];
     CUfileIOEvents_t* io_events = new CUfileIOEvents_t[config.queueDepth];
@@ -420,17 +435,17 @@ BenchmarkStats benchmarkGDSBatch(const BenchmarkConfig& config) {
 
         // Submit batch if we have operations
         if (batchSize > 0) {
-            // Submit the batch (non-blocking)
-            status = cuFileBatchIOSubmit(batchSize, submitBatch, 0);
+            // Submit the batch (non-blocking) with correct API signature
+            status = cuFileBatchIOSubmit(batch_handle, batchSize, submitBatch, 0);
             if (status.err != CU_FILE_SUCCESS) {
                 fprintf(stderr, "Batch submit failed: %d\n", status.err);
                 break;
             }
         }
 
-        // Poll for completions
-        int numEvents = config.queueDepth;
-        status = cuFileBatchIOGetStatus(config.queueDepth, io_events, &numEvents, 0);
+        // Poll for completions with correct API signature
+        unsigned int numEvents = config.queueDepth;
+        status = cuFileBatchIOGetStatus(batch_handle, 0, &numEvents, io_events, NULL);
 
         if (status.err == CU_FILE_SUCCESS || status.err == CU_FILE_WAITING) {
             for (int i = 0; i < numEvents; i++) {
@@ -466,6 +481,9 @@ BenchmarkStats benchmarkGDSBatch(const BenchmarkConfig& config) {
     // Cleanup
     delete[] io_batch;
     delete[] io_events;
+
+    // Destroy batch handle
+    cuFileBatchIODestroy(batch_handle);
 
     cuFileHandleDeregister(cf_handle);
     close(fd);
