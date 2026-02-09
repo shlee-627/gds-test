@@ -769,14 +769,17 @@ BenchmarkStats benchmarkTraditional(const BenchmarkConfig& config) {
     std::vector<off_t> offsets;
     size_t maxOffset = (config.fileSize / config.blockSize) * config.blockSize;
 
+    // Pre-generate offsets (will wrap around in time-based mode)
+    int offsetCount = (config.runtimeSeconds > 0) ? 1000000 : config.numIterations;
+
     if (config.isRandom) {
         srand(12345);
-        for (int i = 0; i < config.numIterations; i++) {
+        for (int i = 0; i < offsetCount; i++) {
             off_t offset = (rand() % (maxOffset / config.blockSize)) * config.blockSize;
             offsets.push_back(offset);
         }
     } else {
-        for (int i = 0; i < config.numIterations; i++) {
+        for (int i = 0; i < offsetCount; i++) {
             off_t offset = (i * config.blockSize) % maxOffset;
             offsets.push_back(offset);
         }
@@ -799,11 +802,28 @@ BenchmarkStats benchmarkTraditional(const BenchmarkConfig& config) {
 
     // Actual benchmark
     double totalStart = getTime();
+    bool timeBasedMode = (config.runtimeSeconds > 0);
+    double benchmarkEndTime = totalStart + config.runtimeSeconds;
 
-    for (int i = 0; i < config.numIterations; i++) {
+    int completedOps = 0;
+    while (true) {
+        // Check termination condition
+        if (timeBasedMode) {
+            if (getTime() >= benchmarkEndTime) {
+                break;  // Time expired
+            }
+        } else {
+            if (completedOps >= config.numIterations) {
+                break;  // All iterations done
+            }
+        }
+
+        // Get offset (wrap around for time-based mode)
+        int offsetIndex = timeBasedMode ? (completedOps % offsets.size()) : completedOps;
+
         double opStart = getTime();
 
-        lseek(fd, offsets[i], SEEK_SET);
+        lseek(fd, offsets[offsetIndex], SEEK_SET);
 
         ssize_t ret;
         if (config.isWrite) {
@@ -821,9 +841,10 @@ BenchmarkStats benchmarkTraditional(const BenchmarkConfig& config) {
 
         stats.latencies.push_back(latency_us);
         stats.totalBytes += config.blockSize;
+        completedOps++;
 
         if (ret < 0) {
-            fprintf(stderr, "I/O error at iteration %d\n", i);
+            fprintf(stderr, "I/O error at iteration %d\n", completedOps);
             break;
         }
     }
