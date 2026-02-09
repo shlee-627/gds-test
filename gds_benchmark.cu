@@ -218,18 +218,21 @@ BenchmarkStats benchmarkGDS(const BenchmarkConfig& config) {
         return stats;
     }
 
-    // Prepare random offsets if needed
+    // Prepare random offsets
     std::vector<off_t> offsets;
     size_t maxOffset = (config.fileSize / config.blockSize) * config.blockSize;
 
+    // Pre-generate offsets (will wrap around in time-based mode)
+    int offsetCount = (config.runtimeSeconds > 0) ? 1000000 : config.numIterations;
+
     if (config.isRandom) {
         srand(12345);  // Fixed seed for reproducibility
-        for (int i = 0; i < config.numIterations; i++) {
+        for (int i = 0; i < offsetCount; i++) {
             off_t offset = (rand() % (maxOffset / config.blockSize)) * config.blockSize;
             offsets.push_back(offset);
         }
     } else {
-        for (int i = 0; i < config.numIterations; i++) {
+        for (int i = 0; i < offsetCount; i++) {
             off_t offset = (i * config.blockSize) % maxOffset;
             offsets.push_back(offset);
         }
@@ -247,15 +250,32 @@ BenchmarkStats benchmarkGDS(const BenchmarkConfig& config) {
 
     // Actual benchmark
     double totalStart = getTime();
+    bool timeBasedMode = (config.runtimeSeconds > 0);
+    double benchmarkEndTime = totalStart + config.runtimeSeconds;
 
-    for (int i = 0; i < config.numIterations; i++) {
+    int completedOps = 0;
+    while (true) {
+        // Check termination condition
+        if (timeBasedMode) {
+            if (getTime() >= benchmarkEndTime) {
+                break;  // Time expired
+            }
+        } else {
+            if (completedOps >= config.numIterations) {
+                break;  // All iterations done
+            }
+        }
+
+        // Get offset (wrap around for time-based mode)
+        int offsetIndex = timeBasedMode ? (completedOps % offsets.size()) : completedOps;
+
         double opStart = getTime();
 
         ssize_t ret;
         if (config.isWrite) {
-            ret = cuFileWrite(cf_handle, d_buffer, config.blockSize, offsets[i], 0);
+            ret = cuFileWrite(cf_handle, d_buffer, config.blockSize, offsets[offsetIndex], 0);
         } else {
-            ret = cuFileRead(cf_handle, d_buffer, config.blockSize, offsets[i], 0);
+            ret = cuFileRead(cf_handle, d_buffer, config.blockSize, offsets[offsetIndex], 0);
         }
 
         CHECK_CUDA(cudaDeviceSynchronize());
@@ -265,9 +285,10 @@ BenchmarkStats benchmarkGDS(const BenchmarkConfig& config) {
 
         stats.latencies.push_back(latency_us);
         stats.totalBytes += config.blockSize;
+        completedOps++;
 
         if (ret < 0) {
-            fprintf(stderr, "cuFile operation failed at iteration %d\n", i);
+            fprintf(stderr, "cuFile operation failed at iteration %d\n", completedOps);
             break;
         }
     }
