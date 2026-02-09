@@ -423,7 +423,7 @@ BenchmarkStats benchmarkGDSBatch(const BenchmarkConfig& config) {
     while (true) {
         // Check termination condition
         if (timeBasedMode) {
-            if (getTime() >= endTime) {
+            if (getTime() >= benchmarkEndTime) {
                 break;  // Time expired
             }
         } else {
