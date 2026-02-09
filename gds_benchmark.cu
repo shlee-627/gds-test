@@ -1040,7 +1040,7 @@ int main(int argc, char** argv) {
         int iterations;
         if (runtimeSeconds > 0) {
             // Time-based mode: use large number for offset array generation
-            iterations = 1000000;  // Generate 1M offsets to cycle through
+            iterations = 10000000;  // Generate 1M offsets to cycle through
         } else if (customIterations > 0) {
             iterations = customIterations;
         } else {
