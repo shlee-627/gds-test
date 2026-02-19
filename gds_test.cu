@@ -215,38 +215,61 @@ double benchmarkPinned(const char* filename, size_t fileSize) {
 // GPU Direct Storage (Write) GPU -> SSD
 double benchmarkGDSWrite(const char* filename, size_t fileSize) {
     printf("=== GPU Direct Storage Write Benchmark (GPU → SSD) ===\n");
-    
+
+    double t0, t1;
+    double time_driverOpen, time_cudaMalloc, time_cudaMemset, time_fileOpen,
+           time_handleRegister, time_cuFileWrite, time_cudaSync,
+           time_handleDeregister, time_fileClose,
+           time_cudaFree, time_driverClose;
+
     CUfileError_t status;
     CUfileDescr_t cf_descr;
     CUfileHandle_t cf_handle;
-    
-	// Initialize cuFile API
+
+    // [Step 1] Initialize cuFile driver
+    t0 = getTime();
     status = cuFileDriverOpen();
+    t1 = getTime();
+    time_driverOpen = t1 - t0;
     if (status.err != CU_FILE_SUCCESS) {
         fprintf(stderr, "cuFile driver open failed: %d\n", status.err);
         return -1;
     }
-    
-	// GPU Memory Allocation & Create Data in GPU
+
+    // [Step 2] Allocate GPU memory
     char* d_buffer;
+    t0 = getTime();
     CHECK_CUDA(cudaMalloc(&d_buffer, fileSize));
-    CHECK_CUDA(cudaMemset(d_buffer, 0xCD, fileSize));  // Fill Dummy Data
-    
-	// Open File Descriptor (WRONLY and O_DIRECT is needed)
+    t1 = getTime();
+    time_cudaMalloc = t1 - t0;
+
+    // [Step 3] Fill GPU buffer with dummy data (data-prep cost)
+    t0 = getTime();
+    CHECK_CUDA(cudaMemset(d_buffer, 0xCD, fileSize));
+    CHECK_CUDA(cudaDeviceSynchronize());
+    t1 = getTime();
+    time_cudaMemset = t1 - t0;
+
+    // [Step 4] Open file descriptor with O_DIRECT
+    t0 = getTime();
     int fd = open(filename, O_WRONLY | O_CREAT | O_DIRECT, 0644);
+    t1 = getTime();
+    time_fileOpen = t1 - t0;
     if (fd < 0) {
         perror("Failed to open file with O_DIRECT for writing");
         cudaFree(d_buffer);
         cuFileDriverClose();
         return -1;
     }
-    
-	// Registers cuFile Handler
+
+    // [Step 5] Register cuFile handle
     memset(&cf_descr, 0, sizeof(CUfileDescr_t));
     cf_descr.handle.fd = fd;
     cf_descr.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
-    
+    t0 = getTime();
     status = cuFileHandleRegister(&cf_handle, &cf_descr);
+    t1 = getTime();
+    time_handleRegister = t1 - t0;
     if (status.err != CU_FILE_SUCCESS) {
         fprintf(stderr, "cuFile handle register failed: %d\n", status.err);
         close(fd);
@@ -254,61 +277,122 @@ double benchmarkGDSWrite(const char* filename, size_t fileSize) {
         cuFileDriverClose();
         return -1;
     }
-    
-    double startTime = getTime();
-    
-	// GPU Memory -> SSD (File directly)
+
+    double totalStart = getTime();
+
+    // [Step 6] cuFileWrite — blocking call: returns after data is on storage
+    t0 = getTime();
     ssize_t bytesWritten = cuFileWrite(cf_handle, d_buffer, fileSize, 0, 0);
+    t1 = getTime();
+    time_cuFileWrite = t1 - t0;
+
+    // [Step 7] cudaDeviceSynchronize — confirm GPU-side completion
+    t0 = getTime();
     CHECK_CUDA(cudaDeviceSynchronize());
-    
-    double totalTime = getTime() - startTime;
-    
-    printf("GPU → File (Direct): %.3f seconds (%.2f GB/s)\n", 
-           totalTime, (fileSize / (1024.0*1024.0*1024.0)) / totalTime);
-    printf("Bytes written: %zd\n\n", bytesWritten);
-    
+    t1 = getTime();
+    time_cudaSync = t1 - t0;
+
+    double totalTime = getTime() - totalStart;
+
+    // [Step 8] Deregister cuFile handle
+    t0 = getTime();
     cuFileHandleDeregister(cf_handle);
+    t1 = getTime();
+    time_handleDeregister = t1 - t0;
+
+    // [Step 9] Close file descriptor
+    t0 = getTime();
     close(fd);
+    t1 = getTime();
+    time_fileClose = t1 - t0;
+
+    // [Step 10] Free GPU memory
+    t0 = getTime();
     CHECK_CUDA(cudaFree(d_buffer));
+    t1 = getTime();
+    time_cudaFree = t1 - t0;
+
+    // [Step 11] Close cuFile driver
+    t0 = getTime();
     cuFileDriverClose();
-    
+    t1 = getTime();
+    time_driverClose = t1 - t0;
+
+    // --- Report ---
+    double gbSize = fileSize / (1024.0 * 1024.0 * 1024.0);
+    printf("\n[GDS Write] Per-Step Timing Breakdown:\n");
+    printf("  [1] cuFileDriverOpen      : %8.3f ms\n",  time_driverOpen      * 1e3);
+    printf("  [2] cudaMalloc            : %8.3f ms\n",  time_cudaMalloc      * 1e3);
+    printf("  [3] cudaMemset (data prep): %8.3f ms  (%.2f GB/s)\n",
+           time_cudaMemset * 1e3, gbSize / time_cudaMemset);
+    printf("  [4] open(O_DIRECT)        : %8.3f ms\n",  time_fileOpen        * 1e3);
+    printf("  [5] cuFileHandleRegister  : %8.3f ms\n",  time_handleRegister  * 1e3);
+    printf("  [6] cuFileWrite           : %8.3f ms  (%.2f GB/s)\n",
+           time_cuFileWrite * 1e3, gbSize / time_cuFileWrite);
+    printf("  [7] cudaDeviceSynchronize : %8.3f ms\n",  time_cudaSync        * 1e3);
+    printf("  [8] cuFileHandleDeregister: %8.3f ms\n",  time_handleDeregister* 1e3);
+    printf("  [9] close(fd)             : %8.3f ms\n",  time_fileClose       * 1e3);
+    printf("  [10] cudaFree             : %8.3f ms\n",  time_cudaFree        * 1e3);
+    printf("  [11] cuFileDriverClose    : %8.3f ms\n",  time_driverClose     * 1e3);
+    printf("  ----------------------------------------\n");
+    printf("  I/O Total (steps 6+7)     : %8.3f ms  (%.2f GB/s)\n",
+           totalTime * 1e3, gbSize / totalTime);
+    printf("Bytes written: %zd\n\n", bytesWritten);
+
     return totalTime;
 }
 
 // Method 2: Use Classic GDS
 double benchmarkGDS(const char* filename, size_t fileSize) {
     printf("=== GPU Direct Storage Benchmark ===\n");
-    
+
+    double t0, t1;
+    double time_driverOpen, time_cudaMalloc, time_fileOpen,
+           time_handleRegister, time_cuFileRead, time_cudaSync,
+           time_handleDeregister, time_fileClose,
+           time_cudaFree, time_driverClose;
+
     CUfileError_t status;
     CUfileDescr_t cf_descr;
     CUfileHandle_t cf_handle;
-    
-	// Initializes "cuFileAPI"
+
+    // [Step 1] Initialize cuFile driver
+    t0 = getTime();
     status = cuFileDriverOpen();
+    t1 = getTime();
+    time_driverOpen = t1 - t0;
     if (status.err != CU_FILE_SUCCESS) {
         fprintf(stderr, "cuFile driver open failed: %d\n", status.err);
         return -1;
     }
-    
-	// Allocates GPU Memory Space -> For GPU Direct Storage (GDS), aligned Memory space is needed)
+
+    // [Step 2] Allocate GPU memory
     char* d_buffer;
+    t0 = getTime();
     CHECK_CUDA(cudaMalloc(&d_buffer, fileSize));
-    
-	// Open File Descriptor in OS filesystem
+    t1 = getTime();
+    time_cudaMalloc = t1 - t0;
+
+    // [Step 3] Open file descriptor with O_DIRECT
+    t0 = getTime();
     int fd = open(filename, O_RDONLY | O_DIRECT);
+    t1 = getTime();
+    time_fileOpen = t1 - t0;
     if (fd < 0) {
         perror("Failed to open file with O_DIRECT");
         cudaFree(d_buffer);
         cuFileDriverClose();
         return -1;
     }
-    
-	// Registers "cuFile Handle"
+
+    // [Step 4] Register cuFile handle
     memset(&cf_descr, 0, sizeof(CUfileDescr_t));
     cf_descr.handle.fd = fd;
     cf_descr.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
-    
+    t0 = getTime();
     status = cuFileHandleRegister(&cf_handle, &cf_descr);
+    t1 = getTime();
+    time_handleRegister = t1 - t0;
     if (status.err != CU_FILE_SUCCESS) {
         fprintf(stderr, "cuFile handle register failed: %d\n", status.err);
         close(fd);
@@ -316,26 +400,66 @@ double benchmarkGDS(const char* filename, size_t fileSize) {
         cuFileDriverClose();
         return -1;
     }
-    
-    double startTime = getTime();
-    
-	// Read file from SSD to "GPU Memory"
+
+    double totalStart = getTime();
+
+    // [Step 5] cuFileRead — blocking call: returns after data lands in GPU memory
+    t0 = getTime();
     ssize_t bytesRead = cuFileRead(cf_handle, d_buffer, fileSize, 0, 0);
+    t1 = getTime();
+    time_cuFileRead = t1 - t0;
+
+    // [Step 6] cudaDeviceSynchronize — ensure GPU sees the data
+    t0 = getTime();
     CHECK_CUDA(cudaDeviceSynchronize());
-    
-    double totalTime = getTime() - startTime;
-    
-    printf("File → GPU (Direct): %.3f seconds (%.2f GB/s)\n", 
-           totalTime, (fileSize / (1024.0*1024.0*1024.0)) / totalTime);
-    printf("Bytes read: %zd\n\n", bytesRead);
-    
-	
-	// Clear File Desc. and Memory Space
+    t1 = getTime();
+    time_cudaSync = t1 - t0;
+
+    double totalTime = getTime() - totalStart;
+
+    // [Step 7] Deregister cuFile handle
+    t0 = getTime();
     cuFileHandleDeregister(cf_handle);
+    t1 = getTime();
+    time_handleDeregister = t1 - t0;
+
+    // [Step 8] Close file descriptor
+    t0 = getTime();
     close(fd);
+    t1 = getTime();
+    time_fileClose = t1 - t0;
+
+    // [Step 9] Free GPU memory
+    t0 = getTime();
     CHECK_CUDA(cudaFree(d_buffer));
+    t1 = getTime();
+    time_cudaFree = t1 - t0;
+
+    // [Step 10] Close cuFile driver
+    t0 = getTime();
     cuFileDriverClose();
-    
+    t1 = getTime();
+    time_driverClose = t1 - t0;
+
+    // --- Report ---
+    double gbSize = fileSize / (1024.0 * 1024.0 * 1024.0);
+    printf("\n[GDS Read] Per-Step Timing Breakdown:\n");
+    printf("  [1] cuFileDriverOpen      : %8.3f ms\n",  time_driverOpen      * 1e3);
+    printf("  [2] cudaMalloc            : %8.3f ms\n",  time_cudaMalloc      * 1e3);
+    printf("  [3] open(O_DIRECT)        : %8.3f ms\n",  time_fileOpen        * 1e3);
+    printf("  [4] cuFileHandleRegister  : %8.3f ms\n",  time_handleRegister  * 1e3);
+    printf("  [5] cuFileRead            : %8.3f ms  (%.2f GB/s)\n",
+           time_cuFileRead * 1e3, gbSize / time_cuFileRead);
+    printf("  [6] cudaDeviceSynchronize : %8.3f ms\n",  time_cudaSync        * 1e3);
+    printf("  [7] cuFileHandleDeregister: %8.3f ms\n",  time_handleDeregister* 1e3);
+    printf("  [8] close(fd)             : %8.3f ms\n",  time_fileClose       * 1e3);
+    printf("  [9] cudaFree              : %8.3f ms\n",  time_cudaFree        * 1e3);
+    printf("  [10] cuFileDriverClose    : %8.3f ms\n",  time_driverClose     * 1e3);
+    printf("  ----------------------------------------\n");
+    printf("  I/O Total (steps 5+6)     : %8.3f ms  (%.2f GB/s)\n",
+           totalTime * 1e3, gbSize / totalTime);
+    printf("Bytes read: %zd\n\n", bytesRead);
+
     return totalTime;
 }
 #endif
