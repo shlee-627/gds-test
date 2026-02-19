@@ -50,183 +50,43 @@ void createTestFile(const char* filename, size_t size) {
     printf("File created successfully\n\n");
 }
 
-// GPU -> CPU (DRAM) -> File IO
-double benchmarkTraditionalWrite(const char* filename, size_t fileSize) {
-    printf("=== Traditional Write Benchmark (GPU → SSD) ===\n");
-
-	// Setup Host DRAM Memory
-    char* h_buffer = (char*)malloc(fileSize);
-    if (!h_buffer) {
-        fprintf(stderr, "Failed to allocate host memory\n");
-        return -1;
-    }
-
-	// GPU Memory Allocation & Create Data on GPU
-    char* d_buffer;
-    CHECK_CUDA(cudaMalloc(&d_buffer, fileSize));
-    CHECK_CUDA(cudaMemset(d_buffer, 0xCD, fileSize));  // Fill Dummy Data
-
-    double startTime = getTime();
-
-	// 1. GPU Memory -> CPU Memory (cudaMemcpy)
-    double copyStart = getTime();
-    CHECK_CUDA(cudaMemcpy(h_buffer, d_buffer, fileSize, cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaDeviceSynchronize());
-    double copyTime = getTime() - copyStart;
-
-    printf("GPU → CPU: %.3f seconds (%.2f GB/s)\n",
-           copyTime, (fileSize / (1024.0*1024.0*1024.0)) / copyTime);
-
-	// 2. CPU Memory -> SSD (File I/O)
-    double ioStart = getTime();
-    FILE* fp = fopen(filename, "wb");
-    if (!fp) {
-        perror("Failed to open file for writing");
-        free(h_buffer);
-        cudaFree(d_buffer);
-        return -1;
-    }
-
-    size_t bytesWritten = fwrite(h_buffer, 1, fileSize, fp);
-    fflush(fp);
-    fclose(fp);
-    double ioTime = getTime() - ioStart;
-
-    printf("CPU → File: %.3f seconds (%.2f GB/s)\n",
-           ioTime, (fileSize / (1024.0*1024.0*1024.0)) / ioTime);
-
-    double totalTime = getTime() - startTime;
-    printf("Total time: %.3f seconds (%.2f GB/s)\n",
-           totalTime, (fileSize / (1024.0*1024.0*1024.0)) / totalTime);
-    printf("Bytes written: %zu\n\n", bytesWritten);
-
-    free(h_buffer);
-    CHECK_CUDA(cudaFree(d_buffer));
-
-    return totalTime;
-}
-
-double benchmarkTraditional(const char* filename, size_t fileSize) {
-    printf("=== Traditional I/O Benchmark ===\n");
-    
-    char* h_buffer = (char*)malloc(fileSize);
-    if (!h_buffer) {
-        fprintf(stderr, "Failed to allocate host memory\n");
-        return -1;
-    }
-    
-	// Allocate GPU Memory Buffer
-    char* d_buffer;
-    CHECK_CUDA(cudaMalloc(&d_buffer, fileSize));
-    
-    double startTime = getTime();
-    
-   	// 1. Read File from SSD to Host Memory 
-    double ioStart = getTime();
-    FILE* fp = fopen(filename, "rb");
-    if (!fp) {
-        perror("Failed to open file");
-        free(h_buffer);
-        cudaFree(d_buffer);
-        return -1;
-    }
-    
-    size_t bytesRead = fread(h_buffer, 1, fileSize, fp);		// Due to it uses fread without O_DIRECT, file system is used.
-    fclose(fp);
-    double ioTime = getTime() - ioStart;
-    
-    printf("File → CPU: %.3f seconds (%.2f GB/s)\n", 
-           ioTime, (fileSize / (1024.0*1024.0*1024.0)) / ioTime);
-    
-	// 2. Copy copied data from host memory to GDDR (GPU Memory)
-    double copyStart = getTime();
-    CHECK_CUDA(cudaMemcpy(d_buffer, h_buffer, fileSize, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaDeviceSynchronize());
-    double copyTime = getTime() - copyStart;
-    
-    printf("CPU → GPU: %.3f seconds (%.2f GB/s)\n", 
-           copyTime, (fileSize / (1024.0*1024.0*1024.0)) / copyTime);
-    
-    double totalTime = getTime() - startTime;
-    printf("Total time: %.3f seconds (%.2f GB/s)\n", 
-           totalTime, (fileSize / (1024.0*1024.0*1024.0)) / totalTime);
-    printf("Bytes read: %zu\n\n", bytesRead);
-    
-	// Free Memory Space
-    free(h_buffer);
-    CHECK_CUDA(cudaFree(d_buffer));
-    
-    return totalTime;
-}
-
-// Method 3: Use Pinned Memory (Q. What's Pinned Memory?)
-double benchmarkPinned(const char* filename, size_t fileSize) {
-    printf("=== Pinned Memory I/O Benchmark ===\n");
-    
-	// Allocates "Pinned" Host Memory Space
-    char* h_buffer;
-    CHECK_CUDA(cudaMallocHost(&h_buffer, fileSize));
-    
-	// Allocates GPU Memory space
-    char* d_buffer;
-    CHECK_CUDA(cudaMalloc(&d_buffer, fileSize));
-    
-    double startTime = getTime();
-    
-	// 1. Read file from SSD to pinned CPU memory
-    double ioStart = getTime();
-    FILE* fp = fopen(filename, "rb");
-    if (!fp) {
-        perror("Failed to open file");
-        cudaFreeHost(h_buffer);
-        cudaFree(d_buffer);
-        return -1;
-    }
-    
-    size_t bytesRead = fread(h_buffer, 1, fileSize, fp);
-    fclose(fp);
-    double ioTime = getTime() - ioStart;
-    
-    printf("File → Pinned CPU: %.3f seconds (%.2f GB/s)\n", 
-           ioTime, (fileSize / (1024.0*1024.0*1024.0)) / ioTime);
-    
-	// 2. Copies data from pinned CPU memory to GPU Memory (Asynchronously) -> It means it requires copying! NOT shared Memory
-    double copyStart = getTime();
-    CHECK_CUDA(cudaMemcpy(d_buffer, h_buffer, fileSize, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaDeviceSynchronize());
-    double copyTime = getTime() - copyStart;
-    
-    printf("Pinned CPU → GPU: %.3f seconds (%.2f GB/s)\n", 
-           copyTime, (fileSize / (1024.0*1024.0*1024.0)) / copyTime);
-    
-    double totalTime = getTime() - startTime;
-    printf("Total time: %.3f seconds (%.2f GB/s)\n", 
-           totalTime, (fileSize / (1024.0*1024.0*1024.0)) / totalTime);
-    printf("Bytes read: %zu\n\n", bytesRead);
-    
-	// Free memory Space
-    CHECK_CUDA(cudaFreeHost(h_buffer));
-    CHECK_CUDA(cudaFree(d_buffer));
-    
-    return totalTime;
-}
-
 #ifdef USE_CUFILE
-// GPU Direct Storage (Write) GPU -> SSD
+// GDS Write: 4KB block size, QD=1 (sequential, one I/O at a time)
 double benchmarkGDSWrite(const char* filename, size_t fileSize) {
-    printf("=== GPU Direct Storage Write Benchmark (GPU → SSD) ===\n");
+    const size_t blockSize = 4096;  // 4KB
+    const size_t numBlocks = fileSize / blockSize;
 
+    printf("=== GPU Direct Storage Write Benchmark (4KB blocks, QD=1) ===\n");
+    printf("  File size : %.2f GB\n", fileSize / (1024.0 * 1024.0 * 1024.0));
+    printf("  Block size: %zu B\n",   blockSize);
+    printf("  Num blocks: %zu\n\n",   numBlocks);
+
+    // CPU-side wall-clock timers (for non-stream operations)
     double t0, t1;
-    double time_driverOpen, time_cudaMalloc, time_cudaMemset, time_fileOpen,
-           time_handleRegister, time_cuFileWrite, time_cudaSync,
-           time_handleDeregister, time_fileClose,
-           time_cudaFree, time_driverClose;
+    double time_driverOpen, time_fileOpen, time_handleRegister,
+           time_handleDeregister, time_fileClose, time_driverClose;
+
+    // GPU-side event timers (for CUDA stream operations)
+    cudaEvent_t ev_malloc_start, ev_malloc_end;
+    cudaEvent_t ev_memset_start, ev_memset_end;
+    cudaEvent_t ev_sync_start,   ev_sync_end;
+    cudaEvent_t ev_free_start,   ev_free_end;
+    float gpu_ms_malloc, gpu_ms_memset, gpu_ms_sync, gpu_ms_free;
+
+    CHECK_CUDA(cudaEventCreate(&ev_malloc_start));
+    CHECK_CUDA(cudaEventCreate(&ev_malloc_end));
+    CHECK_CUDA(cudaEventCreate(&ev_memset_start));
+    CHECK_CUDA(cudaEventCreate(&ev_memset_end));
+    CHECK_CUDA(cudaEventCreate(&ev_sync_start));
+    CHECK_CUDA(cudaEventCreate(&ev_sync_end));
+    CHECK_CUDA(cudaEventCreate(&ev_free_start));
+    CHECK_CUDA(cudaEventCreate(&ev_free_end));
 
     CUfileError_t status;
     CUfileDescr_t cf_descr;
     CUfileHandle_t cf_handle;
 
-    // [Step 1] Initialize cuFile driver
+    // [Step 1] Initialize cuFile driver  (CPU-side: pure ioctl, no GPU stream)
     t0 = getTime();
     status = cuFileDriverOpen();
     t1 = getTime();
@@ -236,21 +96,24 @@ double benchmarkGDSWrite(const char* filename, size_t fileSize) {
         return -1;
     }
 
-    // [Step 2] Allocate GPU memory
+    // [Step 2] Allocate GPU memory (one 4KB buffer, reused for every block)
+    //          GPU-side event: cudaMalloc touches GPU MMU
     char* d_buffer;
-    t0 = getTime();
-    CHECK_CUDA(cudaMalloc(&d_buffer, fileSize));
-    t1 = getTime();
-    time_cudaMalloc = t1 - t0;
+    CHECK_CUDA(cudaEventRecord(ev_malloc_start, 0));
+    CHECK_CUDA(cudaMalloc(&d_buffer, blockSize));
+    CHECK_CUDA(cudaEventRecord(ev_malloc_end, 0));
+    CHECK_CUDA(cudaEventSynchronize(ev_malloc_end));
+    CHECK_CUDA(cudaEventElapsedTime(&gpu_ms_malloc, ev_malloc_start, ev_malloc_end));
 
-    // [Step 3] Fill GPU buffer with dummy data (data-prep cost)
-    t0 = getTime();
-    CHECK_CUDA(cudaMemset(d_buffer, 0xCD, fileSize));
-    CHECK_CUDA(cudaDeviceSynchronize());
-    t1 = getTime();
-    time_cudaMemset = t1 - t0;
+    // [Step 3] Fill GPU buffer with dummy data  (GPU-side event: fill kernel)
+    //          Same 4KB pattern is written for every block.
+    CHECK_CUDA(cudaEventRecord(ev_memset_start, 0));
+    CHECK_CUDA(cudaMemset(d_buffer, 0xCD, blockSize));
+    CHECK_CUDA(cudaEventRecord(ev_memset_end, 0));
+    CHECK_CUDA(cudaEventSynchronize(ev_memset_end));
+    CHECK_CUDA(cudaEventElapsedTime(&gpu_ms_memset, ev_memset_start, ev_memset_end));
 
-    // [Step 4] Open file descriptor with O_DIRECT
+    // [Step 4] Open file descriptor with O_DIRECT  (CPU-side: VFS/kernel call)
     t0 = getTime();
     int fd = open(filename, O_WRONLY | O_CREAT | O_DIRECT, 0644);
     t1 = getTime();
@@ -262,7 +125,7 @@ double benchmarkGDSWrite(const char* filename, size_t fileSize) {
         return -1;
     }
 
-    // [Step 5] Register cuFile handle
+    // [Step 5] Register cuFile handle  (CPU-side: ioctl into nvidia-fs)
     memset(&cf_descr, 0, sizeof(CUfileDescr_t));
     cf_descr.handle.fd = fd;
     cf_descr.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
@@ -278,85 +141,145 @@ double benchmarkGDSWrite(const char* filename, size_t fileSize) {
         return -1;
     }
 
+    // [Step 6] Issue 4KB writes sequentially at QD=1
+    //          Each cuFileWrite is a synchronous blocking ioctl containing
+    //          the full PCIe DMA + NVMe write for that 4KB block.
+    size_t totalBytesWritten = 0;
+    double minLatency_us = 1e18, maxLatency_us = 0.0, sumLatency_us = 0.0;
+
     double totalStart = getTime();
 
-    // [Step 6] cuFileWrite — blocking call: returns after data is on storage
-    t0 = getTime();
-    ssize_t bytesWritten = cuFileWrite(cf_handle, d_buffer, fileSize, 0, 0);
-    t1 = getTime();
-    time_cuFileWrite = t1 - t0;
+    for (size_t i = 0; i < numBlocks; i++) {
+        off_t fileOffset = (off_t)(i * blockSize);
 
-    // [Step 7] cudaDeviceSynchronize — confirm GPU-side completion
-    t0 = getTime();
+        double blockStart = getTime();
+        ssize_t ret = cuFileWrite(cf_handle, d_buffer, blockSize, fileOffset, 0);
+        double blockEnd = getTime();
+
+        if (ret < 0) {
+            fprintf(stderr, "cuFileWrite failed at block %zu (offset %zu)\n", i, (size_t)fileOffset);
+            break;
+        }
+
+        totalBytesWritten += (size_t)ret;
+
+        double lat_us = (blockEnd - blockStart) * 1e6;
+        sumLatency_us += lat_us;
+        if (lat_us < minLatency_us) minLatency_us = lat_us;
+        if (lat_us > maxLatency_us) maxLatency_us = lat_us;
+    }
+
+    // [Step 7] cudaDeviceSynchronize  (GPU-side event: residual GPU work
+    //          after all cuFileWrites; expected ~0 ms for synchronous GDS)
+    CHECK_CUDA(cudaEventRecord(ev_sync_start, 0));
     CHECK_CUDA(cudaDeviceSynchronize());
-    t1 = getTime();
-    time_cudaSync = t1 - t0;
+    CHECK_CUDA(cudaEventRecord(ev_sync_end, 0));
+    CHECK_CUDA(cudaEventSynchronize(ev_sync_end));
+    CHECK_CUDA(cudaEventElapsedTime(&gpu_ms_sync, ev_sync_start, ev_sync_end));
 
     double totalTime = getTime() - totalStart;
 
-    // [Step 8] Deregister cuFile handle
+    // [Step 8] Deregister cuFile handle  (CPU-side: ioctl into nvidia-fs)
     t0 = getTime();
     cuFileHandleDeregister(cf_handle);
     t1 = getTime();
     time_handleDeregister = t1 - t0;
 
-    // [Step 9] Close file descriptor
+    // [Step 9] Close file descriptor  (CPU-side: VFS)
     t0 = getTime();
     close(fd);
     t1 = getTime();
     time_fileClose = t1 - t0;
 
-    // [Step 10] Free GPU memory
-    t0 = getTime();
+    // [Step 10] Free GPU memory  (GPU-side event: cudaFree flushes GPU MMU)
+    CHECK_CUDA(cudaEventRecord(ev_free_start, 0));
     CHECK_CUDA(cudaFree(d_buffer));
-    t1 = getTime();
-    time_cudaFree = t1 - t0;
+    CHECK_CUDA(cudaEventRecord(ev_free_end, 0));
+    CHECK_CUDA(cudaEventSynchronize(ev_free_end));
+    CHECK_CUDA(cudaEventElapsedTime(&gpu_ms_free, ev_free_start, ev_free_end));
 
-    // [Step 11] Close cuFile driver
+    // [Step 11] Close cuFile driver  (CPU-side: ioctl)
     t0 = getTime();
     cuFileDriverClose();
     t1 = getTime();
     time_driverClose = t1 - t0;
 
+    // Destroy events
+    CHECK_CUDA(cudaEventDestroy(ev_malloc_start));
+    CHECK_CUDA(cudaEventDestroy(ev_malloc_end));
+    CHECK_CUDA(cudaEventDestroy(ev_memset_start));
+    CHECK_CUDA(cudaEventDestroy(ev_memset_end));
+    CHECK_CUDA(cudaEventDestroy(ev_sync_start));
+    CHECK_CUDA(cudaEventDestroy(ev_sync_end));
+    CHECK_CUDA(cudaEventDestroy(ev_free_start));
+    CHECK_CUDA(cudaEventDestroy(ev_free_end));
+
     // --- Report ---
-    double gbSize = fileSize / (1024.0 * 1024.0 * 1024.0);
-    printf("\n[GDS Write] Per-Step Timing Breakdown:\n");
-    printf("  [1] cuFileDriverOpen      : %8.3f ms\n",  time_driverOpen      * 1e3);
-    printf("  [2] cudaMalloc            : %8.3f ms\n",  time_cudaMalloc      * 1e3);
-    printf("  [3] cudaMemset (data prep): %8.3f ms  (%.2f GB/s)\n",
-           time_cudaMemset * 1e3, gbSize / time_cudaMemset);
-    printf("  [4] open(O_DIRECT)        : %8.3f ms\n",  time_fileOpen        * 1e3);
-    printf("  [5] cuFileHandleRegister  : %8.3f ms\n",  time_handleRegister  * 1e3);
-    printf("  [6] cuFileWrite           : %8.3f ms  (%.2f GB/s)\n",
-           time_cuFileWrite * 1e3, gbSize / time_cuFileWrite);
-    printf("  [7] cudaDeviceSynchronize : %8.3f ms\n",  time_cudaSync        * 1e3);
-    printf("  [8] cuFileHandleDeregister: %8.3f ms\n",  time_handleDeregister* 1e3);
-    printf("  [9] close(fd)             : %8.3f ms\n",  time_fileClose       * 1e3);
-    printf("  [10] cudaFree             : %8.3f ms\n",  time_cudaFree        * 1e3);
-    printf("  [11] cuFileDriverClose    : %8.3f ms\n",  time_driverClose     * 1e3);
-    printf("  ----------------------------------------\n");
-    printf("  I/O Total (steps 6+7)     : %8.3f ms  (%.2f GB/s)\n",
-           totalTime * 1e3, gbSize / totalTime);
-    printf("Bytes written: %zd\n\n", bytesWritten);
+    double gbSize    = (double)totalBytesWritten / (1024.0 * 1024.0 * 1024.0);
+    double avgLat_us = sumLatency_us / (double)numBlocks;
+    double iops      = (double)numBlocks / totalTime;
+
+    printf("[GDS Write] Setup/Teardown Timing:\n");
+    printf("  Timer key: [CPU] = wall-clock (CLOCK_MONOTONIC), [GPU] = cudaEvent hardware timestamp\n\n");
+    printf("  [1]  cuFileDriverOpen      [CPU]: %8.3f ms\n", time_driverOpen       * 1e3);
+    printf("  [2]  cudaMalloc (4KB)      [GPU]: %8.3f ms\n", gpu_ms_malloc);
+    printf("  [3]  cudaMemset (4KB fill) [GPU]: %8.3f ms\n", gpu_ms_memset);
+    printf("  [4]  open(O_DIRECT)        [CPU]: %8.3f ms\n", time_fileOpen         * 1e3);
+    printf("  [5]  cuFileHandleRegister  [CPU]: %8.3f ms\n", time_handleRegister   * 1e3);
+    printf("  [6]  I/O loop (see below)  [CPU]: %8.3f ms\n", totalTime             * 1e3);
+    printf("  [7]  cudaDeviceSynchronize [GPU]: %8.3f ms\n", gpu_ms_sync);
+    printf("  [8]  cuFileHandleDeregister[CPU]: %8.3f ms\n", time_handleDeregister * 1e3);
+    printf("  [9]  close(fd)             [CPU]: %8.3f ms\n", time_fileClose        * 1e3);
+    printf("  [10] cudaFree              [GPU]: %8.3f ms\n", gpu_ms_free);
+    printf("  [11] cuFileDriverClose     [CPU]: %8.3f ms\n", time_driverClose      * 1e3);
+
+    printf("\n[GDS Write] 4KB QD=1 I/O Statistics:\n");
+    printf("  Total bytes written: %zu (%.2f GB)\n", totalBytesWritten, gbSize);
+    printf("  Total I/O time     : %.3f ms\n",        totalTime * 1e3);
+    printf("  Throughput         : %.4f GB/s\n",       gbSize / totalTime);
+    printf("  IOPS               : %.2f ops/s\n",      iops);
+    printf("  Per-block latency [CPU]:\n");
+    printf("    Min : %.2f us\n", minLatency_us);
+    printf("    Avg : %.2f us\n", avgLat_us);
+    printf("    Max : %.2f us\n", maxLatency_us);
+    printf("\n");
 
     return totalTime;
 }
 
-// Method 2: Use Classic GDS
+// GDS Read: 4KB block size, QD=1 (sequential, one I/O at a time)
 double benchmarkGDS(const char* filename, size_t fileSize) {
-    printf("=== GPU Direct Storage Benchmark ===\n");
+    const size_t blockSize = 4096;  // 4KB
+    const size_t numBlocks = fileSize / blockSize;
 
+    printf("=== GPU Direct Storage Read Benchmark (4KB blocks, QD=1) ===\n");
+    printf("  File size : %.2f GB\n", fileSize / (1024.0 * 1024.0 * 1024.0));
+    printf("  Block size: %zu B\n",   blockSize);
+    printf("  Num blocks: %zu\n\n",   numBlocks);
+
+    // CPU-side wall-clock timers (for non-stream operations)
     double t0, t1;
-    double time_driverOpen, time_cudaMalloc, time_fileOpen,
-           time_handleRegister, time_cuFileRead, time_cudaSync,
-           time_handleDeregister, time_fileClose,
-           time_cudaFree, time_driverClose;
+    double time_driverOpen, time_fileOpen, time_handleRegister,
+           time_handleDeregister, time_fileClose, time_driverClose;
+
+    // GPU-side event timers (for CUDA stream operations)
+    cudaEvent_t ev_malloc_start, ev_malloc_end;
+    cudaEvent_t ev_sync_start,   ev_sync_end;
+    cudaEvent_t ev_free_start,   ev_free_end;
+    float gpu_ms_malloc, gpu_ms_sync, gpu_ms_free;
+
+    CHECK_CUDA(cudaEventCreate(&ev_malloc_start));
+    CHECK_CUDA(cudaEventCreate(&ev_malloc_end));
+    CHECK_CUDA(cudaEventCreate(&ev_sync_start));
+    CHECK_CUDA(cudaEventCreate(&ev_sync_end));
+    CHECK_CUDA(cudaEventCreate(&ev_free_start));
+    CHECK_CUDA(cudaEventCreate(&ev_free_end));
 
     CUfileError_t status;
     CUfileDescr_t cf_descr;
     CUfileHandle_t cf_handle;
 
-    // [Step 1] Initialize cuFile driver
+    // [Step 1] Initialize cuFile driver  (CPU-side: pure ioctl, no GPU stream)
     t0 = getTime();
     status = cuFileDriverOpen();
     t1 = getTime();
@@ -366,14 +289,16 @@ double benchmarkGDS(const char* filename, size_t fileSize) {
         return -1;
     }
 
-    // [Step 2] Allocate GPU memory
+    // [Step 2] Allocate GPU memory (one 4KB buffer, reused for every block)
+    //          GPU-side event: cudaMalloc touches GPU MMU
     char* d_buffer;
-    t0 = getTime();
-    CHECK_CUDA(cudaMalloc(&d_buffer, fileSize));
-    t1 = getTime();
-    time_cudaMalloc = t1 - t0;
+    CHECK_CUDA(cudaEventRecord(ev_malloc_start, 0));
+    CHECK_CUDA(cudaMalloc(&d_buffer, blockSize));
+    CHECK_CUDA(cudaEventRecord(ev_malloc_end, 0));
+    CHECK_CUDA(cudaEventSynchronize(ev_malloc_end));
+    CHECK_CUDA(cudaEventElapsedTime(&gpu_ms_malloc, ev_malloc_start, ev_malloc_end));
 
-    // [Step 3] Open file descriptor with O_DIRECT
+    // [Step 3] Open file descriptor with O_DIRECT  (CPU-side: VFS/kernel call)
     t0 = getTime();
     int fd = open(filename, O_RDONLY | O_DIRECT);
     t1 = getTime();
@@ -385,7 +310,7 @@ double benchmarkGDS(const char* filename, size_t fileSize) {
         return -1;
     }
 
-    // [Step 4] Register cuFile handle
+    // [Step 4] Register cuFile handle  (CPU-side: ioctl into nvidia-fs)
     memset(&cf_descr, 0, sizeof(CUfileDescr_t));
     cf_descr.handle.fd = fd;
     cf_descr.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
@@ -401,64 +326,107 @@ double benchmarkGDS(const char* filename, size_t fileSize) {
         return -1;
     }
 
+    // [Step 5] Issue 4KB reads sequentially at QD=1
+    //          Each cuFileRead is a synchronous blocking ioctl containing
+    //          the full disk I/O + PCIe DMA for that 4KB block.
+    //          CPU wall-clock is used per-block; cudaEvent used for the
+    //          post-loop synchronize.
+    size_t totalBytesRead = 0;
+    double minLatency_us = 1e18, maxLatency_us = 0.0, sumLatency_us = 0.0;
+
     double totalStart = getTime();
 
-    // [Step 5] cuFileRead — blocking call: returns after data lands in GPU memory
-    t0 = getTime();
-    ssize_t bytesRead = cuFileRead(cf_handle, d_buffer, fileSize, 0, 0);
-    t1 = getTime();
-    time_cuFileRead = t1 - t0;
+    for (size_t i = 0; i < numBlocks; i++) {
+        off_t fileOffset = (off_t)(i * blockSize);
 
-    // [Step 6] cudaDeviceSynchronize — ensure GPU sees the data
-    t0 = getTime();
+        double blockStart = getTime();
+        ssize_t ret = cuFileRead(cf_handle, d_buffer, blockSize, fileOffset, 0);
+        double blockEnd = getTime();
+
+        if (ret < 0) {
+            fprintf(stderr, "cuFileRead failed at block %zu (offset %zu)\n", i, (size_t)fileOffset);
+            break;
+        }
+
+        totalBytesRead += (size_t)ret;
+
+        double lat_us = (blockEnd - blockStart) * 1e6;
+        sumLatency_us += lat_us;
+        if (lat_us < minLatency_us) minLatency_us = lat_us;
+        if (lat_us > maxLatency_us) maxLatency_us = lat_us;
+    }
+
+    // [Step 6] cudaDeviceSynchronize  (GPU-side event: residual GPU work
+    //          after all cuFileReads; expected ~0 ms for synchronous GDS)
+    CHECK_CUDA(cudaEventRecord(ev_sync_start, 0));
     CHECK_CUDA(cudaDeviceSynchronize());
-    t1 = getTime();
-    time_cudaSync = t1 - t0;
+    CHECK_CUDA(cudaEventRecord(ev_sync_end, 0));
+    CHECK_CUDA(cudaEventSynchronize(ev_sync_end));
+    CHECK_CUDA(cudaEventElapsedTime(&gpu_ms_sync, ev_sync_start, ev_sync_end));
 
     double totalTime = getTime() - totalStart;
 
-    // [Step 7] Deregister cuFile handle
+    // [Step 7] Deregister cuFile handle  (CPU-side: ioctl into nvidia-fs)
     t0 = getTime();
     cuFileHandleDeregister(cf_handle);
     t1 = getTime();
     time_handleDeregister = t1 - t0;
 
-    // [Step 8] Close file descriptor
+    // [Step 8] Close file descriptor  (CPU-side: VFS)
     t0 = getTime();
     close(fd);
     t1 = getTime();
     time_fileClose = t1 - t0;
 
-    // [Step 9] Free GPU memory
-    t0 = getTime();
+    // [Step 9] Free GPU memory  (GPU-side event: cudaFree flushes GPU MMU)
+    CHECK_CUDA(cudaEventRecord(ev_free_start, 0));
     CHECK_CUDA(cudaFree(d_buffer));
-    t1 = getTime();
-    time_cudaFree = t1 - t0;
+    CHECK_CUDA(cudaEventRecord(ev_free_end, 0));
+    CHECK_CUDA(cudaEventSynchronize(ev_free_end));
+    CHECK_CUDA(cudaEventElapsedTime(&gpu_ms_free, ev_free_start, ev_free_end));
 
-    // [Step 10] Close cuFile driver
+    // [Step 10] Close cuFile driver  (CPU-side: ioctl)
     t0 = getTime();
     cuFileDriverClose();
     t1 = getTime();
     time_driverClose = t1 - t0;
 
+    // Destroy events
+    CHECK_CUDA(cudaEventDestroy(ev_malloc_start));
+    CHECK_CUDA(cudaEventDestroy(ev_malloc_end));
+    CHECK_CUDA(cudaEventDestroy(ev_sync_start));
+    CHECK_CUDA(cudaEventDestroy(ev_sync_end));
+    CHECK_CUDA(cudaEventDestroy(ev_free_start));
+    CHECK_CUDA(cudaEventDestroy(ev_free_end));
+
     // --- Report ---
-    double gbSize = fileSize / (1024.0 * 1024.0 * 1024.0);
-    printf("\n[GDS Read] Per-Step Timing Breakdown:\n");
-    printf("  [1] cuFileDriverOpen      : %8.3f ms\n",  time_driverOpen      * 1e3);
-    printf("  [2] cudaMalloc            : %8.3f ms\n",  time_cudaMalloc      * 1e3);
-    printf("  [3] open(O_DIRECT)        : %8.3f ms\n",  time_fileOpen        * 1e3);
-    printf("  [4] cuFileHandleRegister  : %8.3f ms\n",  time_handleRegister  * 1e3);
-    printf("  [5] cuFileRead            : %8.3f ms  (%.2f GB/s)\n",
-           time_cuFileRead * 1e3, gbSize / time_cuFileRead);
-    printf("  [6] cudaDeviceSynchronize : %8.3f ms\n",  time_cudaSync        * 1e3);
-    printf("  [7] cuFileHandleDeregister: %8.3f ms\n",  time_handleDeregister* 1e3);
-    printf("  [8] close(fd)             : %8.3f ms\n",  time_fileClose       * 1e3);
-    printf("  [9] cudaFree              : %8.3f ms\n",  time_cudaFree        * 1e3);
-    printf("  [10] cuFileDriverClose    : %8.3f ms\n",  time_driverClose     * 1e3);
-    printf("  ----------------------------------------\n");
-    printf("  I/O Total (steps 5+6)     : %8.3f ms  (%.2f GB/s)\n",
-           totalTime * 1e3, gbSize / totalTime);
-    printf("Bytes read: %zd\n\n", bytesRead);
+    double gbSize    = (double)totalBytesRead / (1024.0 * 1024.0 * 1024.0);
+    double avgLat_us = sumLatency_us / (double)numBlocks;
+    double iops      = (double)numBlocks / totalTime;
+
+    printf("[GDS Read] Setup/Teardown Timing:\n");
+    printf("  Timer key: [CPU] = wall-clock (CLOCK_MONOTONIC), [GPU] = cudaEvent hardware timestamp\n\n");
+    printf("  [1]  cuFileDriverOpen      [CPU]: %8.3f ms\n", time_driverOpen     * 1e3);
+    printf("  [2]  cudaMalloc (4KB)      [GPU]: %8.3f ms\n", gpu_ms_malloc);
+    printf("  [3]  open(O_DIRECT)        [CPU]: %8.3f ms\n", time_fileOpen       * 1e3);
+    printf("  [4]  cuFileHandleRegister  [CPU]: %8.3f ms\n", time_handleRegister * 1e3);
+    printf("  [5]  I/O loop (see below)  [CPU]: %8.3f ms\n", totalTime           * 1e3);
+    printf("  [6]  cudaDeviceSynchronize [GPU]: %8.3f ms\n", gpu_ms_sync);
+    printf("  [7]  cuFileHandleDeregister[CPU]: %8.3f ms\n", time_handleDeregister * 1e3);
+    printf("  [8]  close(fd)             [CPU]: %8.3f ms\n", time_fileClose      * 1e3);
+    printf("  [9]  cudaFree              [GPU]: %8.3f ms\n", gpu_ms_free);
+    printf("  [10] cuFileDriverClose     [CPU]: %8.3f ms\n", time_driverClose    * 1e3);
+
+    printf("\n[GDS Read] 4KB QD=1 I/O Statistics:\n");
+    printf("  Total bytes read : %zu (%.2f GB)\n", totalBytesRead, gbSize);
+    printf("  Total I/O time   : %.3f ms\n",        totalTime * 1e3);
+    printf("  Throughput       : %.4f GB/s\n",       gbSize / totalTime);
+    printf("  IOPS             : %.2f ops/s\n",      iops);
+    printf("  Per-block latency [CPU]:\n");
+    printf("    Min : %.2f us\n", minLatency_us);
+    printf("    Avg : %.2f us\n", avgLat_us);
+    printf("    Max : %.2f us\n", maxLatency_us);
+    printf("\n");
 
     return totalTime;
 }
@@ -492,39 +460,21 @@ int main(int argc, char** argv) {
     
 	// Creates Test file in SSD
     createTestFile(filename, fileSize);
-    
-    // Executes benchmarks - Method 1 ~ 3
-    double tradTime = benchmarkTraditional(filename, fileSize);
-
-	double tradWriteTime = benchmarkTraditionalWrite(writeFilename, fileSize);
 
 #ifdef USE_CUFILE
-    double gdsTime = benchmarkGDS(filename, fileSize);
-	double gdsWriteTime = benchmarkGDSWrite(writeFilename, fileSize);
-    
-	// Compare Results
-    printf("=== Performance Summary (Read) ===\n");
-    printf("Traditional (SSD->GPU):    %.3f seconds (%.2f GB/s)\n", 
-           tradTime, (fileSize / (1024.0*1024.0*1024.0)) / tradTime);
-    printf("GDS (SSD->GPU):            %.3f seconds (%.2f GB/s) [%.1fx faster]\n", 
-           gdsTime, (fileSize / (1024.0*1024.0*1024.0)) / gdsTime,
-           tradTime / gdsTime);
-	printf("==================================\n\n");
-    printf("=== Performance Summary (Write) ===\n");
-    printf("Traditional (GPU->SSD):    %.3f seconds (%.2f GB/s)\n", 
-           tradWriteTime, (fileSize / (1024.0*1024.0*1024.0)) / tradWriteTime);
-    printf("GDS (GPU->SSD):            %.3f seconds (%.2f GB/s) [%.1fx faster]\n", 
-           gdsWriteTime, (fileSize / (1024.0*1024.0*1024.0)) / gdsWriteTime,
-           tradWriteTime / gdsWriteTime);
-	printf("===================================\n");
+    // GDS Read: 4KB blocks, QD=1
+    benchmarkGDS(filename, fileSize);
 
+    // GDS Write: 4KB blocks, QD=1
+    benchmarkGDSWrite(writeFilename, fileSize);
 #else
     printf("\nNote: GDS benchmark not available (USE_CUFILE not defined)\n");
     printf("To enable GDS: Install GPUDirect Storage and compile with -DUSE_CUFILE -lcufile\n");
 #endif
 
-	// Clean File
+	// Clean Files
     unlink(filename);
+    unlink(writeFilename);
     
     return 0;
 }
